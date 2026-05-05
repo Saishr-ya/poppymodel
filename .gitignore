@@ -1,0 +1,15 @@
+﻿.env
+__pycache__/
+*.pyc
+*.pkl
+data/raw/
+data/processed/
+data/scores/
+results/
+*.parquet
+.dvc/tmp/
+.prefect/
+.pytest_cache/
+*.egg-info/
+dist/
+.DS_Store
