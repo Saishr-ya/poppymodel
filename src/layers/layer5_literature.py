@@ -29,7 +29,7 @@ Bio team:
 from __future__ import annotations
 import logging
 import math
-import re
+import os
 import time
 from datetime import datetime
 from typing import Optional
@@ -44,6 +44,16 @@ logger = logging.getLogger(__name__)
 
 PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 CLINICALTRIALS_BASE = "https://clinicaltrials.gov/api/v2"
+
+# Add to .env as NCBI_API_KEY — raises rate limit from 3 req/sec to 10 req/sec.
+# Register free at: https://www.ncbi.nlm.nih.gov/account/
+NCBI_API_KEY = os.getenv("NCBI_API_KEY", "")
+
+# Polite User-Agent for ClinicalTrials — prevents silent rate-limiting during batch runs.
+# Replace your@email.com with a real contact email.
+CLINICALTRIALS_HEADERS = {
+    "User-Agent": "PoppyEngine/1.0 (drug repurposing research; contact shruthisathya@g.ucla.edu)"
+}
 
 # Indian journals that signal off-label use in target market
 INDIAN_JOURNALS = {
@@ -62,41 +72,51 @@ CURRENT_YEAR = datetime.now().year
 class PubMedClient:
     """Queries PubMed E-utilities for co-occurrence and case report detection."""
 
+    def _ncbi_params(self, extra: dict) -> dict:
+        """
+        Build params dict for NCBI requests, injecting the API key when available.
+        Without the key: 3 requests/second limit.
+        With the key: 10 requests/second limit.
+        """
+        params = {**extra}
+        if NCBI_API_KEY:
+            params["api_key"] = NCBI_API_KEY
+        return params
+
     @cached_api_call(ttl_seconds=86400 * 7)   # 7-day cache
     def search(self, query: str, max_results: int = 500) -> list[dict]:
         """
         Run a PubMed search and return article metadata (PMID, year, journal, title).
+
+        Uses PMIDs directly for esummary rather than WebEnv history server,
+        which is more reliable when results are served from Redis cache.
         """
         # Step 1: esearch to get PMIDs
         esearch_url = f"{PUBMED_BASE}/esearch.fcgi"
-        params = {
+        params = self._ncbi_params({
             "db": "pubmed",
             "term": query,
             "retmax": max_results,
             "retmode": "json",
-            "usehistory": "y",
-        }
+        })
         try:
             r = requests.get(esearch_url, params=params, timeout=15)
             r.raise_for_status()
             data = r.json()
             pmids = data.get("esearchresult", {}).get("idlist", [])
-            web_env = data.get("esearchresult", {}).get("webenv")
-            query_key = data.get("esearchresult", {}).get("querykey")
 
             if not pmids:
                 return []
 
-            # Step 2: esummary to get article metadata
+            # Step 2: esummary using PMIDs directly (not WebEnv — more cache-stable)
             time.sleep(0.4)
             esummary_url = f"{PUBMED_BASE}/esummary.fcgi"
-            summary_params = {
+            summary_params = self._ncbi_params({
                 "db": "pubmed",
-                "query_key": query_key,
-                "WebEnv": web_env,
+                "id": ",".join(pmids),
                 "retmax": max_results,
                 "retmode": "json",
-            }
+            })
             r2 = requests.get(esummary_url, params=summary_params, timeout=20)
             r2.raise_for_status()
             summary = r2.json()
@@ -120,6 +140,7 @@ class PubMedClient:
             logger.error(f"PubMed search failed for '{query}': {e}")
             return []
 
+    @cached_api_call(ttl_seconds=86400 * 7)
     def cooccurrence_score(
         self,
         drug_name: str,
@@ -132,8 +153,7 @@ class PubMedClient:
         Recent papers weighted more heavily (exponential decay by age).
         Indian-journal papers weighted by indian_weight multiplier.
 
-        Returns:
-            Float score (higher = more literature evidence). Not normalized.
+        Cached directly so batch runs don't recompute for the same pair.
         """
         query = f'"{drug_name}"[Title/Abstract] AND "{disease_name}"[Title/Abstract]'
         articles = self.search(query, max_results=200)
@@ -144,18 +164,16 @@ class PubMedClient:
         score = 0.0
         for article in articles:
             age = max(0, CURRENT_YEAR - article.get("year", CURRENT_YEAR))
-            # Exponential decay: papers lose half their weight every `recency_half_life_years`
             recency_weight = math.exp(-0.693 * age / recency_half_life_years)
-
             journal = article.get("journal", "")
             journal_weight = indian_weight if journal in INDIAN_JOURNALS else 1.0
-
             score += recency_weight * journal_weight
 
         return score
 
+    @cached_api_call(ttl_seconds=86400 * 7)
     def count_case_reports(self, drug_name: str, disease_name: str) -> int:
-        """Count case reports/series for this drug-disease combination."""
+        """Count case reports/series for this drug-disease combination. Cached."""
         query = (
             f'"{drug_name}"[Title/Abstract] AND "{disease_name}"[Title/Abstract] '
             f'AND ("case report"[Publication Type] OR "case series"[Publication Type])'
@@ -171,8 +189,7 @@ class ClinicalTrialsClient:
     def search_trials(self, drug_name: str, condition: str) -> list[dict]:
         """
         Search ClinicalTrials.gov for trials of this drug in this condition.
-
-        Returns list of trial dicts with: nctId, phase, status, primaryCompletion
+        Sends a User-Agent header to avoid silent rate-limiting during batch runs.
         """
         url = f"{CLINICALTRIALS_BASE}/studies"
         params = {
@@ -183,7 +200,12 @@ class ClinicalTrialsClient:
             "format": "json",
         }
         try:
-            r = requests.get(url, params=params, timeout=20)
+            r = requests.get(
+                url,
+                params=params,
+                headers=CLINICALTRIALS_HEADERS,  # polite User-Agent
+                timeout=20,
+            )
             r.raise_for_status()
             data = r.json()
             studies = data.get("studies", [])
@@ -210,10 +232,11 @@ class ClinicalTrialsClient:
         Compute clinical trial evidence score on the 0–5 scale.
 
         Scale:
-            5 = Phase III with positive results
-            4 = Phase II with positive results
-            3 = Phase I completed
+            5 = Phase III completed
+            4 = Phase II completed or Phase III in progress
+            3 = Phase I completed or Phase II in progress
             2 = Observational / compassionate use study
+            1 = Any registered trial
             0 = No trials found
         """
         trials = self.search_trials(drug_name, condition)
@@ -226,17 +249,10 @@ class ClinicalTrialsClient:
             status = (trial.get("status") or "").upper()
             study_type = (trial.get("study_type") or "").upper()
 
-            # Determine score for this trial
             if "PHASE3" in phase or "PHASE 3" in phase or "III" in phase:
-                if "COMPLETED" in status:
-                    score = 5
-                else:
-                    score = 4
+                score = 5 if "COMPLETED" in status else 4
             elif "PHASE2" in phase or "PHASE 2" in phase or "II" in phase:
-                if "COMPLETED" in status:
-                    score = 4
-                else:
-                    score = 3
+                score = 4 if "COMPLETED" in status else 3
             elif "PHASE1" in phase or "PHASE 1" in phase or "I" in phase:
                 score = 3
             elif "OBSERVATIONAL" in study_type:
@@ -257,10 +273,15 @@ class LiteratureLayer(BaseLayer):
         pair.scores.pubmed_cooccurrence_score
         pair.scores.clinical_trial_evidence   (0–5)
         pair.scores.case_report_count
+
+    Setup:
+        Add NCBI_API_KEY to .env (register at ncbi.nlm.nih.gov/account).
+        Update CLINICALTRIALS_HEADERS with your real contact email.
+        No keys needed for ClinicalTrials.
     """
 
     layer_name = "layer5_literature"
-    version = "1.0"
+    version = "1.1"
 
     def __init__(self, config: Optional[dict] = None):
         super().__init__(config)
