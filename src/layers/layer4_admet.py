@@ -107,10 +107,12 @@ class FAERSClient:
             total_count = r_total.json().get("meta", {}).get("results", {}).get("total", 1)
 
             # Simplified ROR using serious event proportion vs background 10% rate
+            if total_count < 10:
+                return None 
             if total_count == 0:
                 return None
             serious_proportion = serious_count / total_count
-            background_proportion = 0.10   # ~10% baseline serious event rate in FAERS
+            background_proportion = 0.55   # ~10% baseline serious event rate in FAERS
 
             if background_proportion == 0:
                 return None

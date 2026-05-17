@@ -100,12 +100,19 @@ class Flags:
 
     @property
     def is_disqualified(self) -> bool:
+        # Only two hard disqualifiers — both are commercially fatal:
+        #   Patent conflict: a competitor owns the exact indication we'd claim.
+        #   hERG risk: cardiac arrhythmia at therapeutic doses kills the IND.
+        #
+        # FAERS, Lipinski, and bioavailability are NOT hard disqualifiers for
+        # repurposed approved drugs. These drugs are already approved — regulators
+        # have already evaluated safety. FAERS signals are in the context of the
+        # existing indication, not the new one. Lipinski was designed for novel
+        # compound screening, not approved-drug evaluation. These flags penalize
+        # the composite score via admet_composite but do not eliminate candidates.
         return (
             self.existing_patent_on_indication
             or self.herg_risk_high
-            or self.faers_ror_critical
-            or self.bioavailability_insufficient
-            or self.lipinski_violations > 1
         )
 
     @property
@@ -114,12 +121,6 @@ class Flags:
             return "Existing patent covers this indication"
         if self.herg_risk_high:
             return "High hERG cardiotoxicity risk (IC50 < 1 µM)"
-        if self.faers_ror_critical:
-            return "FAERS ROR > 3 for serious adverse events"
-        if self.bioavailability_insufficient:
-            return "Oral bioavailability < 20%"
-        if self.lipinski_violations > 1:
-            return f"Lipinski violations: {self.lipinski_violations}"
         return None
 
 
@@ -145,8 +146,8 @@ class CandidatePair:
     # Traceability — every layer logs its data source and version here
     data_sources: dict = field(default_factory=dict)
 
-    created_at: datetime.datetime = field(default_factory=datetime.datetime.utcnow)
-    updated_at: datetime.datetime = field(default_factory=datetime.datetime.utcnow)
+    created_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+    updated_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
     notes: str = ""
 
     def touch(self):

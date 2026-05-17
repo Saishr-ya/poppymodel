@@ -63,7 +63,7 @@ class BaseLayer(ABC):
             pair = self.score(pair)
             pair.data_sources[self.layer_name] = {
                 "version": self.version,
-                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "status": "ok",
             }
             pair.touch()
@@ -74,7 +74,7 @@ class BaseLayer(ABC):
             )
             pair.data_sources[self.layer_name] = {
                 "version": self.version,
-                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "status": "error",
                 "error": str(exc),
             }
