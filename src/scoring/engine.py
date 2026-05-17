@@ -6,7 +6,7 @@ and returns ranked CandidatePairs.
 
 Usage:
     engine = ScoringEngine.build(config)
-    pair = engine.score_pair("CHEMBL192", "Chronic myeloid leukemia", "ORPHA:355")
+    pair = engine.score_pair("CHEMBL192", "Imatinib", "ORPHA:355", "Chronic myeloid leukemia")
     pairs = engine.score_batch(drug_disease_list)
 
 Layer execution order follows the spec:
@@ -133,8 +133,8 @@ class ScoringEngine:
         self,
         drug_id: str,
         drug_name: str,
+        disease_id: str,        # BUG FIX: was swapped with disease_name in original
         disease_name: str,
-        disease_id: str,
     ) -> CandidatePair:
         """
         Score a single drug-disease pair through all enabled layers.
@@ -142,8 +142,8 @@ class ScoringEngine:
         Args:
             drug_id:      ChEMBL ID (e.g., "CHEMBL192")
             drug_name:    Human-readable drug name (e.g., "Imatinib")
-            disease_name: Human-readable disease name
             disease_id:   Orphanet or OMIM ID (e.g., "ORPHA:355")
+            disease_name: Human-readable disease name
 
         Returns:
             Scored CandidatePair with composite_score set.
@@ -243,7 +243,10 @@ class ScoringEngine:
             lines.append(f"\n#{i} [{pair.composite_score:.3f}] {pair.drug_name} × {pair.disease_name}")
             lines.append(f"     IDs: {pair.drug_id} × {pair.disease_id}")
             lines.append(f"     Business total: {s.business_total}/30")
-            lines.append(f"     Target overlap (Jaccard): {s.target_overlap_jaccard or 'N/A':.4f}" if s.target_overlap_jaccard else f"     Target overlap (Jaccard): N/A")
+            if s.target_overlap_jaccard is not None:
+                lines.append(f"     Target overlap (Jaccard): {s.target_overlap_jaccard:.4f}")
+            else:
+                lines.append(f"     Target overlap (Jaccard): N/A")
             lines.append(f"     Network proximity: {s.network_proximity or 'N/A'}")
             lines.append(f"     ClinicalTrials evidence: {s.clinical_trial_evidence or 0}/5")
             lines.append(f"     SA PGx risk: {s.pgx_metabolizer_risk_score or 'N/A'}")

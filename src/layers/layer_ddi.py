@@ -143,7 +143,8 @@ class DrugBankDDIClient:
         """Load pre-parsed DrugBank DDI data from local JSON file."""
         if self._local_db is not None:
             return self._local_db
-        import os, json
+        import os
+        import json
         path = "data/processed/drugbank_ddis.json"
         if os.path.exists(path):
             with open(path) as f:
@@ -214,9 +215,8 @@ class DDILayer(BaseLayer):
 
     def __init__(self, config: Optional[dict] = None):
         super().__init__(config)
-        self.drugbank = DrugBankDDIClient(
-            api_key=config.get("drugbank_api_key") if config else None
-        )
+        drugbank_api_key = (config or {}).get("drugbank_api_key")
+        self.drugbank = DrugBankDDIClient(api_key=drugbank_api_key)
 
     def score(self, pair: CandidatePair) -> CandidatePair:
         # ── 1. Get candidate drug CYP/transporter profile ─────────────────
@@ -340,6 +340,10 @@ class DDILayer(BaseLayer):
           B) Candidate IS SUBSTRATE → co-med inhibitor raises candidate levels
           C) Co-med INDUCES enzyme → candidate substrate plasma levels drop → efficacy loss
         """
+        # BUG FIX: drug_name is now taken directly from drug_profile.drug_name
+        # (previously routed through a needless module-level placeholder function)
+        candidate_name = drug_profile.drug_name
+
         interactions = []
         comed_substrates = comed_profile.get("substrates", [])
         comed_inhibitors = comed_profile.get("inhibitors", [])
@@ -355,7 +359,7 @@ class DDILayer(BaseLayer):
                     severity=severity,
                     direction="candidate_inhibits",
                     effect=(
-                        f"{pair_drug_name_placeholder(drug_profile)} inhibits {cyp}, "
+                        f"{candidate_name} inhibits {cyp}, "
                         f"raising {comed_name} plasma levels"
                     ),
                     evidence_source="DrugBank_predicted",
@@ -372,7 +376,7 @@ class DDILayer(BaseLayer):
                     direction="candidate_is_substrate",
                     effect=(
                         f"{comed_name} inhibits {cyp}, "
-                        f"raising {drug_profile.drug_name} plasma levels"
+                        f"raising {candidate_name} plasma levels"
                     ),
                     evidence_source="DrugBank_predicted",
                     is_narrow_ti=False,
@@ -388,14 +392,10 @@ class DDILayer(BaseLayer):
                     direction="comed_induces",
                     effect=(
                         f"{comed_name} induces {cyp}, "
-                        f"reducing {drug_profile.drug_name} plasma levels → efficacy risk"
+                        f"reducing {candidate_name} plasma levels → efficacy risk"
                     ),
                     evidence_source="DrugBank_predicted",
                     is_narrow_ti=False,
                 ))
 
         return interactions
-
-
-def pair_drug_name_placeholder(drug_profile: DDIProfile) -> str:
-    return drug_profile.drug_name

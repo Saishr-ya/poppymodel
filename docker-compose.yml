@@ -1,7 +1,5 @@
-version: "3.9"
-
 # Drug Repurposing Engine — Local Development Stack
-# Run: docker-compose up -d
+# Run: docker compose up -d
 # Then: pip install -r requirements.txt && python run_engine.py validate
 
 services:
@@ -17,7 +15,9 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U repurposing"]
+      # -d flag is required: without it pg_isready connects to a DB named after
+      # the user ("repurposing"), which doesn't exist, causing FATAL errors in the log.
+      test: ["CMD-SHELL", "pg_isready -U repurposing -d repurposing_db"]
       interval: 5s
       timeout: 5s
       retries: 5
