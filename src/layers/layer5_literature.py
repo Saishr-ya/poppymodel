@@ -176,7 +176,7 @@ class PubMedClient:
         """Count case reports/series for this drug-disease combination. Cached."""
         query = (
             f'"{drug_name}"[Title/Abstract] AND "{disease_name}"[Title/Abstract] '
-            f'AND ("case report"[Publication Type] OR "case series"[Publication Type])'
+            f'AND ("Case Reports"[Publication Type] OR "case series"[Publication Type])'
         )
         articles = self.search(query, max_results=100)
         return len(articles)
