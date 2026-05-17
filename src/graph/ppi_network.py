@@ -150,13 +150,10 @@ def build_ppi_graph(
 
     return G
 
-
 def _load_string_to_uniprot_map() -> dict[str, str]:
     """
     Load STRING → UniProt ID mapping.
-
-    STRING IDs (9606.ENSP...) need to be mapped to UniProt for cross-referencing.
-    The mapping comes from UniProt's ID mapping service or STRING's protein info file.
+    Prefer aliases file (has real UniProt ACs) over info file (gene names only).
     """
     import json
 
@@ -164,18 +161,20 @@ def _load_string_to_uniprot_map() -> dict[str, str]:
         with open(UNIPROT_MAP_PATH) as f:
             return json.load(f)
 
-    # Build map from STRING info file if available
+    # Use aliases file if available — more reliable than info file
+    aliases_path = "data/raw/string_db/9606.protein.aliases.v12.0.txt.gz"
+    if os.path.exists(aliases_path):
+        return build_uniprot_map_from_aliases(aliases_path)
+
+    # Fall back to info file (gene names — reduced cross-referencing accuracy)
     if os.path.exists(STRING_INFO_PATH):
         return _build_uniprot_map_from_info_file()
 
     logger.warning(
-        f"No STRING→UniProt mapping found at {UNIPROT_MAP_PATH}. "
-        f"Network proximity will use STRING IDs — cross-referencing with DrugBank "
-        f"targets (UniProt) will have reduced coverage. "
-        f"Build the map: python -m src.graph.ppi_network map-uniprot"
+        f"No STRING→UniProt mapping found. "
+        f"Network proximity will have reduced coverage."
     )
     return {}
-
 
 def _build_uniprot_map_from_info_file() -> dict[str, str]:
     """
@@ -209,6 +208,56 @@ def _build_uniprot_map_from_info_file() -> dict[str, str]:
     except Exception as e:
         logger.error(f"Failed to build UniProt map: {e}")
 
+    return mapping
+
+def build_uniprot_map_from_aliases(
+    aliases_path: str = "data/raw/string_db/9606.protein.aliases.v12.0.txt.gz",
+    output_path: str = UNIPROT_MAP_PATH,
+) -> dict[str, str]:
+    """
+    Parse STRING aliases file to build STRING ID → UniProt accession mapping.
+
+    Priority order:
+      1. Ensembl_HGNC_uniprot_ids — canonical IDs curated by HGNC (best)
+      2. UniProt_AC               — may include isoforms, use as fallback
+    """
+    import json
+
+    logger.info(f"Building STRING→UniProt map from aliases file: {aliases_path}")
+
+    hgnc = {}      # string_id → canonical UniProt from HGNC
+    fallback = {}  # string_id → UniProt AC (may be isoform)
+
+    with gzip.open(aliases_path, "rt") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            parts = line.strip().split("\t")
+            if len(parts) < 3:
+                continue
+            string_id = parts[0]
+            alias = parts[1]
+            sources = parts[2]
+
+            if "Ensembl_HGNC_uniprot_ids" in sources:
+                if string_id not in hgnc:
+                    hgnc[string_id] = alias
+
+            elif "UniProt_AC" in sources:
+                if string_id not in fallback:
+                    fallback[string_id] = alias
+
+    # Merge: HGNC canonical wins, UniProt_AC fills the gaps
+    mapping = {**fallback, **hgnc}
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(mapping, f)
+
+    logger.info(
+        f"STRING→UniProt map saved: {len(mapping)} total entries "
+        f"({len(hgnc)} HGNC canonical, {len(fallback)} UniProt_AC fallback) → {output_path}"
+    )
     return mapping
 
 

@@ -151,7 +151,7 @@ class CandidatePair:
     notes: str = ""
 
     def touch(self):
-        self.updated_at = datetime.datetime.utcnow()
+        self.updated_at = datetime.datetime.now(datetime.timezone.utc)
 
     def to_dict(self) -> dict:
         return {
