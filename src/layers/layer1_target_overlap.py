@@ -27,6 +27,8 @@ from src.layers.base import BaseLayer
 from src.scoring.candidate import CandidatePair
 from src.ingestion.chembl_client import ChEMBLClient
 from src.ingestion.disgenet_client import DisGeNETClient
+from src.ingestion.drug_target_resolver import get_drug_targets
+
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +164,7 @@ class TargetOverlapLayer(BaseLayer):
 
     def score(self, pair: CandidatePair) -> CandidatePair:
         # ── Fetch drug target UniProt IDs ──────────────────────────────────
-        drug_targets = self.chembl.get_target_uniprot_ids(pair.drug_id)
+        drug_targets = get_drug_targets(pair.drug_id, pair.drug_name)
         if not drug_targets:
             logger.warning(
                 f"[{self.layer_name}] No targets found for {pair.drug_id} "

@@ -34,6 +34,8 @@ from src.layers.base import BaseLayer
 from src.scoring.candidate import CandidatePair
 from src.ingestion.chembl_client import ChEMBLClient
 from src.ingestion.disgenet_client import DisGeNETClient
+from src.ingestion.drug_target_resolver import get_drug_targets
+
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +222,7 @@ class NetworkProximityLayer(BaseLayer):
             )
             return pair
 
-        drug_targets = self.chembl.get_target_uniprot_ids(pair.drug_id)
+        drug_targets = get_drug_targets(pair.drug_id, pair.drug_name)
         disease_genes = self.disgenet.get_disease_uniprot_ids(pair.disease_id)
 
         if self.use_z_score:
