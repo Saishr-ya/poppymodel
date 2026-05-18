@@ -3,37 +3,33 @@ src/ingestion/pharmgkb_client.py
 
 PharmGKB client for CYP substrate/inhibitor/inducer data.
 
-ISSUE WITH THE PREVIOUS APPROACH:
-  The PharmGKB REST API returns 400 on the relationships endpoint because:
-  - /v1/data/drug/{id}/relationships does not support the parameters used
-  - The PA-prefixed IDs (PA451346 for sildenafil) require exact PharmGKB internal IDs
-  - The 'view=max' + 'limit' combination is not supported
+Fix #6: Added _ensure_data_downloaded() called on __init__ so the
+relationships file is fetched automatically on first use. Previously
+the engine silently fell through to the hardcoded CYP_REFERENCE table
+and never downloaded the full dataset.
 
-CORRECT APPROACH — use their downloadable annotation files:
-  PharmGKB publishes monthly TSV/CSV data dumps at:
-  https://www.pharmgkb.org/downloads
+The hardcoded CYP_REFERENCE table is kept as the last-resort fallback
+(covers the ~30 most common drugs in rare-disease trials) so the engine
+still works offline or if the download fails, but the full PharmGKB file
+is now the primary source when available.
 
-  The key file is: relationships.zip (all gene-drug relationships)
-  This is far more reliable than the REST API and gives you the full dataset locally.
-
-SETUP (one-time, run before using this client):
-  1. Go to: https://www.pharmgkb.org/downloads
-  2. Download: relationships.zip → extract to data/raw/pharmgkb/relationships.tsv
-  3. Download: drugLabels.zip → extract to data/raw/pharmgkb/drugLabels.tsv
-  4. Run: python -m src.ingestion.pharmgkb_client download
-  5. Then: python -m src.ingestion.pharmgkb_client parse
-
-FALLBACK (if download not done):
-  The client falls back to the DrugBank CYP data (from the ADMET layer)
-  and a hardcoded reference table for common CYP substrates/inhibitors.
+Setup:
+  The client auto-downloads on first use. If the network is not available,
+  download manually:
+    https://www.pharmgkb.org/downloads → relationships.zip
+    Extract to: data/raw/pharmgkb/relationships.tsv
+  Then run:
+    python -m src.ingestion.pharmgkb_client parse
 """
 
 from __future__ import annotations
 
 import csv
+import io
 import json
 import logging
 import os
+import zipfile
 from typing import Optional
 
 import requests
@@ -43,23 +39,13 @@ from src.ingestion.cache import cached_api_call
 logger = logging.getLogger(__name__)
 
 PHARMGKB_BASE = "https://api.pharmgkb.org/v1"
-
-PHARMGKB_DOWNLOADS = {
-    "relationships": "https://api.pharmgkb.org/v1/download/file/data/relationships.zip",
-    "drug_labels":   "https://api.pharmgkb.org/v1/download/file/data/drugLabels.zip",
-    "drugs":         "https://api.pharmgkb.org/v1/download/file/data/drugs.zip",
-}
+PHARMGKB_RELATIONSHIPS_URL = "https://api.pharmgkb.org/v1/download/file/data/relationships.zip"
 
 PROCESSED_PGX_PATH = "data/processed/pharmgkb_cyp_profiles.json"
 RAW_RELATIONSHIPS  = "data/raw/pharmgkb/relationships.tsv"
 
-# ── Hardcoded CYP reference (fallback when file not downloaded) ────────────────
-# Source: FDA drug labeling + PharmGKB gold-standard pairs
-# Format: drug_name.lower() → {substrates, inhibitors, inducers}
-# Covers 60+ most common drugs relevant to rare disease trials.
-
+# ── Hardcoded CYP reference — fallback only ────────────────────────────────────
 CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
-    # ── Anticonvulsants (most common co-meds in rare neurological diseases) ──
     "carbamazepine": {
         "substrates": ["CYP3A4", "CYP2C8"],
         "inhibitors": [],
@@ -95,7 +81,6 @@ CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
         "inhibitors": ["CYP2C19", "CYP3A4", "CYP1A2"],
         "inducers":   [],
     },
-    # ── PAH medications ──────────────────────────────────────────────────────
     "sildenafil":    {
         "substrates": ["CYP3A4", "CYP2C9"],
         "inhibitors": [],
@@ -121,13 +106,11 @@ CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
         "inhibitors": [],
         "inducers":   [],
     },
-    # ── Kinase inhibitors (rare cancer/hematologic diseases) ─────────────────
     "imatinib":      {
         "substrates": ["CYP3A4", "CYP2C8"],
         "inhibitors": ["CYP3A4", "CYP2D6", "CYP2C9"],
         "inducers":   [],
     },
-    # ── Metabolic disease drugs ───────────────────────────────────────────────
     "miglustat":     {
         "substrates": [],
         "inhibitors": [],
@@ -138,7 +121,6 @@ CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
         "inhibitors": [],
         "inducers":   [],
     },
-    # ── Immunosuppressants ────────────────────────────────────────────────────
     "tacrolimus":    {
         "substrates": ["CYP3A4", "CYP3A5"],
         "inhibitors": [],
@@ -149,7 +131,6 @@ CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
         "inhibitors": ["CYP3A4", "OATP1B1", "OATP1B3"],
         "inducers":   [],
     },
-    # ── Proton pump inhibitors (common co-med) ────────────────────────────────
     "omeprazole":    {
         "substrates": ["CYP2C19", "CYP3A4"],
         "inhibitors": ["CYP2C19"],
@@ -160,7 +141,6 @@ CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
         "inhibitors": ["CYP2C19"],
         "inducers":   [],
     },
-    # ── Antidepressants (psychiatric comorbidities in rare diseases) ──────────
     "fluoxetine":    {
         "substrates": ["CYP2D6", "CYP2C9"],
         "inhibitors": ["CYP2D6", "CYP2C19"],
@@ -171,7 +151,6 @@ CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
         "inhibitors": ["CYP2D6"],
         "inducers":   [],
     },
-    # ── Antimicrobials (common co-meds) ──────────────────────────────────────
     "fluconazole":   {
         "substrates": ["CYP2C9", "CYP3A4"],
         "inhibitors": ["CYP2C9", "CYP3A4", "CYP2C19"],
@@ -182,13 +161,11 @@ CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
         "inhibitors": [],
         "inducers":   ["CYP3A4", "CYP2C9", "CYP2C19", "CYP1A2", "CYP2B6"],
     },
-    # ── Fenfluramine (chiral switch case study) ────────────────────────────────
     "fenfluramine":  {
         "substrates": ["CYP1A2", "CYP2B6"],
         "inhibitors": [],
         "inducers":   [],
     },
-    # ── Metformin ────────────────────────────────────────────────────────────
     "metformin":     {
         "substrates": [],
         "inhibitors": [],
@@ -204,15 +181,64 @@ class PharmGKBClient:
     Priority order for data lookup:
         1. Parsed PharmGKB relationships file (data/processed/pharmgkb_cyp_profiles.json)
         2. Hardcoded CYP_REFERENCE table (covers most common drugs)
-        3. PharmGKB REST API (drug label endpoint — more reliable than relationships API)
+        3. PharmGKB REST API drug label endpoint
 
-    Usage:
-        client = PharmGKBClient()
-        substrates = client.get_cyp_substrates("sildenafil")  # → ['CYP3A4', 'CYP2C9']
+    Fix #6: _ensure_data_downloaded() is called on __init__ so the full
+    PharmGKB dataset is fetched automatically on first use.
     """
 
     def __init__(self):
         self._parsed_db: Optional[dict] = None
+        self._ensure_data_downloaded()
+
+    # ── Fix #6: auto-download ──────────────────────────────────────────────────
+
+    def _ensure_data_downloaded(self):
+        """
+        Auto-download PharmGKB relationships file if not present.
+
+        Fix #6: Previously the engine silently fell through to the small
+        hardcoded reference table on every run because no download was
+        ever triggered. This method is called once at __init__ and ensures
+        the full dataset is present before any scoring starts.
+        """
+        # Already processed — nothing to do
+        if os.path.exists(PROCESSED_PGX_PATH):
+            return
+
+        # Raw file already present — just parse it
+        if os.path.exists(RAW_RELATIONSHIPS):
+            logger.info("PharmGKB raw relationships file found — parsing...")
+            self._parsed_db = self.parse_relationships_file()
+            return
+
+        # Neither exists — download now
+        logger.info(
+            "PharmGKB relationships file not found — downloading from PharmGKB..."
+        )
+        try:
+            r = requests.get(
+                PHARMGKB_RELATIONSHIPS_URL,
+                timeout=120,
+                stream=True,
+                headers={"User-Agent": "PoppyRepurposingEngine/1.0 (research)"},
+            )
+            r.raise_for_status()
+
+            content = b"".join(r.iter_content(chunk_size=65536))
+            z = zipfile.ZipFile(io.BytesIO(content))
+            os.makedirs("data/raw/pharmgkb", exist_ok=True)
+            z.extractall("data/raw/pharmgkb")
+            logger.info("PharmGKB downloaded successfully. Parsing...")
+            self._parsed_db = self.parse_relationships_file()
+        except Exception as e:
+            logger.error(
+                f"PharmGKB auto-download failed: {e}. "
+                f"Download manually from https://www.pharmgkb.org/downloads "
+                f"and extract to data/raw/pharmgkb/relationships.tsv"
+            )
+
+    # ── Data access ────────────────────────────────────────────────────────────
 
     def _load_parsed_db(self) -> dict:
         """Load parsed PharmGKB relationships if file exists."""
@@ -228,18 +254,15 @@ class PharmGKBClient:
 
     def get_cyp_substrates(self, drug_name: str) -> list[str]:
         """Return list of CYP enzymes for which this drug is a substrate."""
-        profile = self._get_profile(drug_name)
-        return profile.get("substrates", [])
+        return self._get_profile(drug_name).get("substrates", [])
 
     def get_cyp_inhibitors(self, drug_name: str) -> list[str]:
         """Return list of CYP enzymes this drug inhibits."""
-        profile = self._get_profile(drug_name)
-        return profile.get("inhibitors", [])
+        return self._get_profile(drug_name).get("inhibitors", [])
 
     def get_cyp_inducers(self, drug_name: str) -> list[str]:
         """Return list of CYP enzymes this drug induces."""
-        profile = self._get_profile(drug_name)
-        return profile.get("inducers", [])
+        return self._get_profile(drug_name).get("inducers", [])
 
     def get_full_cyp_profile(self, drug_name: str) -> dict[str, list[str]]:
         """Return complete CYP profile: {substrates, inhibitors, inducers}."""
@@ -249,12 +272,12 @@ class PharmGKBClient:
         """Look up CYP profile with fallback chain."""
         key = drug_name.lower().strip()
 
-        # 1. Parsed PharmGKB file
+        # 1. Parsed PharmGKB file (full dataset)
         db = self._load_parsed_db()
         if key in db:
             return db[key]
 
-        # 2. Hardcoded reference table
+        # 2. Hardcoded reference table (fallback for common drugs)
         if key in CYP_REFERENCE:
             return CYP_REFERENCE[key]
 
@@ -263,27 +286,21 @@ class PharmGKBClient:
             if key.startswith(ref_key) or ref_key.startswith(key.split()[0]):
                 return CYP_REFERENCE[ref_key]
 
-        # 3. PharmGKB REST API fallback (more reliable endpoint)
+        # 3. PharmGKB REST API fallback
         api_result = self._query_pharmgkb_api(drug_name)
         if api_result:
             return api_result
 
         logger.warning(
             f"No CYP profile found for '{drug_name}'. "
-            f"Download PharmGKB relationships.tsv to get full coverage: "
+            f"Download PharmGKB relationships.tsv for full coverage: "
             f"https://www.pharmgkb.org/downloads"
         )
         return {"substrates": [], "inhibitors": [], "inducers": []}
 
     @cached_api_call(ttl_seconds=86400 * 90)
     def _query_pharmgkb_api(self, drug_name: str) -> Optional[dict]:
-        """
-        Query PharmGKB drug label API for CYP relationships.
-
-        The WORKING endpoint is /v1/data/clinicalAnnotation (not /relationships).
-        Drug labels contain explicit CYP substrate/inhibitor annotations.
-        """
-        # Search for drug by name to get PharmGKB ID
+        """Query PharmGKB drug label API for CYP relationships (last resort)."""
         try:
             r = requests.get(
                 f"{PHARMGKB_BASE}/data/drug",
@@ -297,28 +314,9 @@ class PharmGKBClient:
             drugs = data.get("data", [])
             if not drugs:
                 return None
-            drug_id = drugs[0].get("id")
-            if not drug_id:
-                return None
-
-            # Get drug label for CYP annotations
-            import time
-            time.sleep(0.5)
-            r2 = requests.get(
-                f"{PHARMGKB_BASE}/data/drug/{drug_id}",
-                params={"view": "max"},
-                headers={"Accept": "application/json"},
-                timeout=15,
-            )
-            if r2.status_code != 200:
-                return None
-
-            # Extract CYP info from drug data
-            # PharmGKB drug objects have a 'crossReferences' field with CYP info
-            # in the drug label text — this requires NLP to extract precisely
-            # Return empty rather than guess
+            # The REST API doesn't expose structured CYP data reliably;
+            # return None here and let the caller fall through to the reference table.
             return None
-
         except Exception as e:
             logger.debug(f"PharmGKB API query failed for {drug_name}: {e}")
             return None
@@ -333,9 +331,6 @@ class PharmGKBClient:
     ) -> dict:
         """
         Parse downloaded PharmGKB relationships.tsv and extract CYP profiles.
-
-        Run after downloading:
-            python -m src.ingestion.pharmgkb_client parse
 
         PharmGKB relationships TSV columns:
             Entity1_id, Entity1_name, Entity1_type,
@@ -359,9 +354,7 @@ class PharmGKBClient:
                 e1_name = row.get("Entity1_name", "").lower()
                 e2_name = row.get("Entity2_name", "").lower()
                 pk_field = row.get("PK", "")
-                assoc = row.get("Association", "")
 
-                # We want Drug ↔ Gene relationships with PK annotation
                 if not pk_field:
                     continue
 
@@ -403,20 +396,12 @@ class PharmGKBClient:
         return cyp_profiles
 
 
-# ── Also update layer_pgx.py to use this client ──────────────────────────────
-# The PGx layer currently imports from pharmgkb_client as:
-#   from src.ingestion.pharmgkb_client import PharmGKBClient
-# No changes needed in layer_pgx.py — it calls get_cyp_substrates() which
-# now routes through the hardcoded reference table.
-
-
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     command = sys.argv[1] if len(sys.argv) > 1 else "help"
 
     if command == "parse":
-        client = PharmGKBClient()
         result = PharmGKBClient.parse_relationships_file()
         print(f"Parsed {len(result)} drug profiles")
 
@@ -429,7 +414,6 @@ if __name__ == "__main__":
     else:
         print("Usage: python -m src.ingestion.pharmgkb_client [parse|test]")
         print()
-        print("Setup:")
-        print("  1. Download: https://www.pharmgkb.org/downloads → relationships.zip")
-        print("  2. Extract to: data/raw/pharmgkb/relationships.tsv")
-        print("  3. Run: python -m src.ingestion.pharmgkb_client parse")
+        print("Auto-download runs on first import. To force a re-download:")
+        print("  rm data/raw/pharmgkb/relationships.tsv data/processed/pharmgkb_cyp_profiles.json")
+        print("  python -m src.ingestion.pharmgkb_client parse")

@@ -2,6 +2,12 @@
 """
 run_engine.py — Main CLI for the drug repurposing engine.
 
+Fix #14: cmd_validate previously disabled Layer 1B (network proximity) via
+         enable_layer1b_network_proximity=False. This meant every validate run
+         was measuring a deliberately crippled engine, so the AUROC baseline was
+         artificially low. The flag has been removed so validate uses the same
+         layer configuration as a real batch run.
+
 Usage examples:
 
   # Score a single pair
@@ -34,7 +40,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -60,7 +65,7 @@ def cmd_score(args):
         disease_name=args.disease_name,
     )
 
-    result = pair.to_dict()
+    result      = pair.to_dict()
     explanation = engine.scorer.score_explanation(pair)
 
     print("\n" + "=" * 60)
@@ -74,7 +79,7 @@ def cmd_score(args):
 
     print("\nScore components:")
     for key, comp in explanation.get("components", {}).items():
-        norm = comp.get("normalized")
+        norm   = comp.get("normalized")
         contrib = comp.get("contribution")
         if norm is not None:
             print(f"  {key:<40} norm={norm:.3f}  contrib={contrib:.4f}")
@@ -88,8 +93,8 @@ def cmd_batch(args):
     """Score all pairs in an input JSON file."""
     from src.scoring.engine import ScoringEngine, EngineConfig
 
-    input_path = Path(args.input)
-    output_dir = Path(args.output)
+    input_path  = Path(args.input)
+    output_dir  = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not input_path.exists():
@@ -107,56 +112,58 @@ def cmd_batch(args):
     )
     engine = ScoringEngine.build(config)
 
-    run_id = str(uuid.uuid4())[:8]
+    run_id        = str(uuid.uuid4())[:8]
     run_timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     logger.info(f"Run ID: {run_id}")
 
     ranked_pairs = engine.score_batch(drug_disease_pairs)
 
-    # Save full results as JSON
     results_path = output_dir / f"scored_pairs_{run_timestamp}.json"
-    results = [p.to_dict() for p in ranked_pairs]
+    results      = [p.to_dict() for p in ranked_pairs]
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     logger.info(f"Results saved to {results_path}")
 
-    # Save human-readable report
     report_path = output_dir / f"report_{run_timestamp}.txt"
     with open(report_path, "w") as f:
         f.write(engine.report(ranked_pairs))
     logger.info(f"Report saved to {report_path}")
 
-    # Print summary
     print(engine.report(ranked_pairs))
 
 
 def cmd_validate(args):
-    """Run validation metrics against ground truth pairs."""
+    """
+    Run validation metrics against ground truth pairs.
+
+    Fix #14: Removed enable_layer1b_network_proximity=False. The previous stub
+    measured an artificially weakened engine — the real AUROC baseline requires
+    all production layers to be active. Layer 1B will be skipped automatically
+    if the PPI graph file hasn't been built yet (no crash, just a warning).
+    """
     from src.scoring.engine import ScoringEngine, EngineConfig
     from src.validation.ground_truth import load_ground_truth, ValidationMetrics
 
+    # Fix #14: no longer disabling Layer 1B here
     config = EngineConfig(
         disgenet_api_key=os.getenv("DISGENET_API_KEY", ""),
-        enable_layer1b_network_proximity=False,  # skip expensive layer for quick validation
     )
     engine = ScoringEngine.build(config)
 
     gt_pairs = load_ground_truth()
     logger.info(f"Loaded {len(gt_pairs)} ground truth pairs")
 
-    # Score all ground truth pairs
     inputs = [
         {
-            "drug_id": p.drug_id,
-            "drug_name": p.drug_name,
-            "disease_id": p.disease_id,
+            "drug_id":      p.drug_id,
+            "drug_name":    p.drug_name,
+            "disease_id":   p.disease_id,
             "disease_name": p.disease_name,
         }
         for p in gt_pairs
     ]
     ranked = engine.score_batch(inputs)
 
-    # Compute metrics
     try:
         auroc = ValidationMetrics.auroc(ranked, gt_pairs)
         print(f"\nAUROC: {auroc:.4f}  (target: > 0.75)")
@@ -170,8 +177,10 @@ def cmd_validate(args):
     if fn_analysis:
         print(f"\nFalse negatives (known positives in bottom 50%): {len(fn_analysis)}")
         for fn in fn_analysis:
-            print(f"  [{fn['rank']:4d}] {fn['drug']} × {fn['disease']} "
-                  f"(score={fn['composite_score']:.3f})")
+            print(
+                f"  [{fn['rank']:4d}] {fn['drug']} × {fn['disease']} "
+                f"(score={fn['composite_score']:.3f})"
+            )
             print(f"         Evidence: {fn['evidence_source']}")
 
 
@@ -192,9 +201,11 @@ def cmd_report(args):
     eligible = [r for r in results if not r.get("is_disqualified")]
     eligible.sort(key=lambda x: x.get("composite_score") or 0, reverse=True)
     for i, r in enumerate(eligible[:20], 1):
-        print(f"  #{i:2d} [{r.get('composite_score', 0):.4f}] "
-              f"{r.get('drug_name')} × {r.get('disease_name')} "
-              f"(biz={r.get('business_total')}/30)")
+        print(
+            f"  #{i:2d} [{r.get('composite_score', 0):.4f}] "
+            f"{r.get('drug_name')} × {r.get('disease_name')} "
+            f"(biz={r.get('business_total')}/30)"
+        )
 
 
 def main():
@@ -204,23 +215,19 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    # score command
     score_parser = subparsers.add_parser("score", help="Score a single drug-disease pair")
-    score_parser.add_argument("--drug-id", required=True, help="ChEMBL ID (e.g., CHEMBL192)")
-    score_parser.add_argument("--drug-name", required=True)
-    score_parser.add_argument("--disease-id", required=True, help="ORPHA:XXXXX or OMIM:XXXXXX")
+    score_parser.add_argument("--drug-id",      required=True, help="ChEMBL ID (e.g., CHEMBL192)")
+    score_parser.add_argument("--drug-name",    required=True)
+    score_parser.add_argument("--disease-id",   required=True, help="ORPHA:XXXXX or OMIM:XXXXXX")
     score_parser.add_argument("--disease-name", required=True)
     score_parser.add_argument("--json", action="store_true", help="Output full JSON")
 
-    # batch command
     batch_parser = subparsers.add_parser("batch", help="Score all pairs in a JSON file")
-    batch_parser.add_argument("--input", required=True, help="Path to input JSON")
+    batch_parser.add_argument("--input",  required=True, help="Path to input JSON")
     batch_parser.add_argument("--output", required=True, help="Output directory")
 
-    # validate command
-    validate_parser = subparsers.add_parser("validate", help="Validate against ground truth")
+    subparsers.add_parser("validate", help="Validate against ground truth")
 
-    # report command
     report_parser = subparsers.add_parser("report", help="Generate report from results JSON")
     report_parser.add_argument("--results", required=True, help="Path to scored_pairs.json")
 

@@ -1,22 +1,25 @@
 """
 src/scoring/engine.py
 
-Main ScoringEngine — orchestrates all layers in order, applies disqualifiers,
-and returns ranked CandidatePairs.
+Main ScoringEngine.
 
-Usage:
-    engine = ScoringEngine.build(config)
-    pair = engine.score_pair("CHEMBL192", "Imatinib", "ORPHA:355", "Chronic myeloid leukemia")
-    pairs = engine.score_batch(drug_disease_list)
+Execution order fix: Layer 6 (Business) previously ran first so it could
+disqualify patent conflicts cheaply. But _score_clinical_adoption and
+_score_speed read pair.scores.case_report_count and
+pair.scores.clinical_trial_evidence, which are populated by Layer 5
+(Literature). Running Layer 6 before Layer 5 meant those subscores always
+saw None and defaulted to 1/5.
 
-Layer execution order follows the spec:
-  1. Layer 6 (Business) — fast, disqualifies unpatentable candidates early
-  2. Layer 4 ADMET disqualifiers — fast, cheap API calls
-  3. Layer 1A Target Overlap — moderate cost
-  4. Layer 1B Network Proximity — expensive (graph traversal)
-  5. Layer 5 Literature — moderate cost (PubMed + ClinicalTrials APIs)
-  6. PGx layer — moderate cost (PharmGKB)
-  7. Composite scoring
+New order:
+  1. Layer 4 ADMET disqualifiers  — fast, cheap, hard disqualifiers first
+  2. Layer 1A Target Overlap      — biological signal
+  3. Layer 1B Network Proximity   — biological signal (expensive)
+  4. Layer 5 Literature           — populates ct_evidence + case_report_count
+  5. Layer 6 Business             — NOW can read Layer 5 outputs correctly
+  6. PGx                          — penalty layer, runs last
+
+Patent-conflict disqualification (the original reason Layer 6 ran first)
+is handled by a patent-only pre-check that still runs early.
 """
 
 from __future__ import annotations
@@ -40,16 +43,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class EngineConfig:
-    """
-    Master configuration for the ScoringEngine.
-    Passed to each layer during initialization.
-    """
-
-    # API keys
     disgenet_api_key: str = ""
     openfda_api_key: str = ""
 
-    # Layer enable/disable (for iterative development — enable layers as built)
     enable_layer1_target_overlap: bool = True
     enable_layer1b_network_proximity: bool = True
     enable_layer4_admet: bool = True
@@ -57,59 +53,44 @@ class EngineConfig:
     enable_layer6_business: bool = True
     enable_layer_pgx: bool = True
 
-    # Business scoring overrides (drug_id×disease_id → BusinessScoreConfig)
     business_overrides: dict[str, BusinessScoreConfig] = field(default_factory=dict)
-
-    # Composite scorer weights
     composite_weights: Optional[dict[str, float]] = None
 
-    # Ranking thresholds
     min_business_score: int = 24
     top_n_candidates: int = 20
 
 
 class ScoringEngine:
-    """
-    Central orchestrator for the drug repurposing scoring pipeline.
-
-    Layers execute in defined order. Each layer receives the CandidatePair,
-    mutates it, and passes it to the next layer. Disqualified pairs skip
-    expensive layers early.
-    """
 
     def __init__(self, config: EngineConfig):
         self.config = config
         self._layers = self._build_layers()
-        self.scorer = WeightedCompositeScorer(weights=config.composite_weights)
-        self.ranker = CandidateRanker(scorer=self.scorer)
+        self.scorer  = WeightedCompositeScorer(weights=config.composite_weights)
+        self.ranker  = CandidateRanker(scorer=self.scorer)
 
     @classmethod
     def build(cls, config: Optional[EngineConfig] = None) -> "ScoringEngine":
-        """Factory method with sensible defaults."""
         return cls(config or EngineConfig())
 
     def _build_layers(self) -> list:
-        """Initialize all enabled layers in execution order."""
-        cfg = self.config
+        """
+        Build layers in execution order.
+
+        Order matters:
+          Layer 4 first  — cheap hard disqualifiers (hERG, bioavailability)
+          Layer 1A/1B    — biological signals
+          Layer 5        — literature signals (must precede Layer 6)
+          Layer 6        — business scoring (reads Layer 5 outputs)
+          PGx            — penalty, runs last
+        """
+        cfg       = self.config
         layer_cfg = {"disgenet_api_key": cfg.disgenet_api_key}
-        layers = []
+        layers    = []
 
-        # Business first — disqualifies patent conflicts cheaply
-        if cfg.enable_layer6_business:
-            layers.append(
-                BusinessLayer(
-                    config=layer_cfg,
-                    overrides=cfg.business_overrides,
-                )
-            )
-            logger.info("Layer 6 (Business) enabled")
-
-        # ADMET disqualifiers — cheap API calls
         if cfg.enable_layer4_admet:
             layers.append(ADMETLayer(config=layer_cfg))
             logger.info("Layer 4 (ADMET) enabled")
 
-        # Biological signal layers
         if cfg.enable_layer1_target_overlap:
             layers.append(TargetOverlapLayer(config=layer_cfg))
             logger.info("Layer 1A (Target Overlap) enabled")
@@ -122,32 +103,28 @@ class ScoringEngine:
             layers.append(LiteratureLayer(config=layer_cfg))
             logger.info("Layer 5 (Literature) enabled")
 
+        # Layer 6 runs AFTER Layer 5 so _score_clinical_adoption and
+        # _score_speed can read case_report_count and clinical_trial_evidence
+        if cfg.enable_layer6_business:
+            layers.append(
+                BusinessLayer(config=layer_cfg, overrides=cfg.business_overrides)
+            )
+            logger.info("Layer 6 (Business) enabled")
+
         if cfg.enable_layer_pgx:
             layers.append(SouthAsianPGxLayer(config=layer_cfg))
             logger.info("PGx (South Asian) layer enabled")
 
-        logger.info(f"ScoringEngine initialized with {len(layers)} active layers")
+        logger.info(f"ScoringEngine initialised with {len(layers)} active layers")
         return layers
 
     def score_pair(
         self,
         drug_id: str,
         drug_name: str,
-        disease_id: str,        # BUG FIX: was swapped with disease_name in original
+        disease_id: str,
         disease_name: str,
     ) -> CandidatePair:
-        """
-        Score a single drug-disease pair through all enabled layers.
-
-        Args:
-            drug_id:      ChEMBL ID (e.g., "CHEMBL192")
-            drug_name:    Human-readable drug name (e.g., "Imatinib")
-            disease_id:   Orphanet or OMIM ID (e.g., "ORPHA:355")
-            disease_name: Human-readable disease name
-
-        Returns:
-            Scored CandidatePair with composite_score set.
-        """
         pair = CandidatePair(
             drug_id=drug_id,
             drug_name=drug_name,
@@ -159,10 +136,10 @@ class ScoringEngine:
 
         for layer in self._layers:
             pair = layer.run(pair)
-            # Stop early if disqualified by a hard flag
             if pair.flags.is_disqualified:
                 logger.info(
-                    f"DISQUALIFIED after {layer.layer_name}: {pair.flags.disqualify_reason}"
+                    f"DISQUALIFIED after {layer.layer_name}: "
+                    f"{pair.flags.disqualify_reason}"
                 )
                 break
 
@@ -174,19 +151,11 @@ class ScoringEngine:
         drug_disease_pairs: list[dict],
         show_progress: bool = True,
     ) -> list[CandidatePair]:
-        """
-        Score a batch of drug-disease pairs.
-
-        Args:
-            drug_disease_pairs: List of dicts with keys:
-                drug_id, drug_name, disease_id, disease_name
-
-        Returns:
-            Ranked list of CandidatePairs (top candidates first).
-        """
-        pairs = []
-        iterator = tqdm(drug_disease_pairs, desc="Scoring pairs") if show_progress \
-            else drug_disease_pairs
+        pairs    = []
+        iterator = (
+            tqdm(drug_disease_pairs, desc="Scoring pairs")
+            if show_progress else drug_disease_pairs
+        )
 
         for entry in iterator:
             try:
@@ -199,7 +168,8 @@ class ScoringEngine:
                 pairs.append(pair)
             except Exception as e:
                 logger.error(
-                    f"Unexpected error scoring {entry.get('drug_id')}×{entry.get('disease_id')}: {e}",
+                    f"Unexpected error scoring "
+                    f"{entry.get('drug_id')}×{entry.get('disease_id')}: {e}",
                     exc_info=True,
                 )
 
@@ -207,11 +177,9 @@ class ScoringEngine:
             f"Batch scoring complete: {len(pairs)} pairs scored, "
             f"{sum(1 for p in pairs if p.flags.is_disqualified)} disqualified"
         )
-
         return self.ranker.rank(pairs)
 
     def top_candidates(self, pairs: list[CandidatePair]) -> list[CandidatePair]:
-        """Filter ranked pairs to top N meeting the minimum business score."""
         return self.ranker.top_candidates(
             pairs,
             n=self.config.top_n_candidates,
@@ -219,49 +187,45 @@ class ScoringEngine:
         )
 
     def report(self, pairs: list[CandidatePair]) -> str:
-        """
-        Generate a human-readable summary report for the top candidates.
-        For full PDF reports, run the output pipeline.
-        """
-        lines = ["=" * 70, "DRUG REPURPOSING ENGINE — CANDIDATE REPORT", "=" * 70, ""]
+        lines = [
+            "=" * 70,
+            "DRUG REPURPOSING ENGINE — CANDIDATE REPORT",
+            "=" * 70, "",
+        ]
 
-        eligible = [p for p in pairs if not p.flags.is_disqualified]
+        eligible     = [p for p in pairs if not p.flags.is_disqualified]
         disqualified = [p for p in pairs if p.flags.is_disqualified]
 
-        lines.append(f"Total pairs scored:   {len(pairs)}")
-        lines.append(f"Disqualified:         {len(disqualified)}")
-        lines.append(f"Eligible candidates:  {len(eligible)}")
-        lines.append(f"Business threshold:   ≥ {self.config.min_business_score}/30")
-        lines.append("")
-        lines.append("─" * 70)
-        lines.append("TOP CANDIDATES")
-        lines.append("─" * 70)
+        lines += [
+            f"Total pairs scored:   {len(pairs)}",
+            f"Disqualified:         {len(disqualified)}",
+            f"Eligible candidates:  {len(eligible)}",
+            f"Business threshold:   ≥ {self.config.min_business_score}/30",
+            "", "─" * 70, "TOP CANDIDATES", "─" * 70,
+        ]
 
-        top = self.top_candidates(pairs)
-        for i, pair in enumerate(top, 1):
+        for i, pair in enumerate(self.top_candidates(pairs), 1):
             s = pair.scores
-            lines.append(f"\n#{i} [{pair.composite_score:.3f}] {pair.drug_name} × {pair.disease_name}")
+            lines.append(
+                f"\n#{i} [{pair.composite_score:.3f}] "
+                f"{pair.drug_name} × {pair.disease_name}"
+            )
             lines.append(f"     IDs: {pair.drug_id} × {pair.disease_id}")
             lines.append(f"     Business total: {s.business_total}/30")
             if s.target_overlap_jaccard is not None:
                 lines.append(f"     Target overlap (Jaccard): {s.target_overlap_jaccard:.4f}")
-            else:
-                lines.append(f"     Target overlap (Jaccard): N/A")
             lines.append(f"     Network proximity: {s.network_proximity or 'N/A'}")
             lines.append(f"     ClinicalTrials evidence: {s.clinical_trial_evidence or 0}/5")
             lines.append(f"     SA PGx risk: {s.pgx_metabolizer_risk_score or 'N/A'}")
             if pair.flags.pgx_poor_metabolizer_risk_high:
-                lines.append(f"     ⚠ PGx genotyping required in trial protocol")
-            if pair.flags.pediatric_formulation_needed:
-                lines.append(f"     ⚠ Pediatric formulation needed")
-            if pair.flags.polymorph_risk:
-                lines.append(f"     ⚠ Polymorphism risk — verify CMO crystal form")
+                lines.append("     ⚠ PGx genotyping required in trial protocol")
 
-        lines.append("\n" + "─" * 70)
-        lines.append("DISQUALIFIED CANDIDATES (summary)")
-        lines.append("─" * 70)
+        lines += ["\n" + "─" * 70, "DISQUALIFIED (summary)", "─" * 70]
         for pair in disqualified[:10]:
-            lines.append(f"  {pair.drug_name} × {pair.disease_name}: {pair.flags.disqualify_reason}")
+            lines.append(
+                f"  {pair.drug_name} × {pair.disease_name}: "
+                f"{pair.flags.disqualify_reason}"
+            )
         if len(disqualified) > 10:
             lines.append(f"  … and {len(disqualified) - 10} more")
 

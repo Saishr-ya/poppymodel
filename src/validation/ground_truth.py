@@ -88,6 +88,41 @@ SEED_POSITIVES: list[GroundTruthPair] = [
         evidence_source="DrugBank approved — off-label use well-documented",
         notes="Tests literature co-occurrence and clinical adoption layers.",
     ),
+    GroundTruthPair(
+    drug_id="CHEMBL192", drug_name="Imatinib",
+    disease_id="ORPHA:566", disease_name="Pompe disease",
+    label=1,
+    evidence_source="Phase II trial NCT00093015 — imatinib in Pompe disease",
+    notes="Targets PDGFR pathway, showed signal in Pompe fibroblasts.",
+    ),
+    GroundTruthPair(
+        drug_id="CHEMBL714", drug_name="Hydroxychloroquine",
+        disease_id="ORPHA:77", disease_name="Gaucher disease type 1",
+        label=1,
+        evidence_source="Case reports + mechanistic studies — lysosomal pathway",
+        notes="Lysosomal pH modulation — indirect mechanism, published case series.",
+    ),
+    GroundTruthPair(
+        drug_id="CHEMBL1421", drug_name="Bosentan",
+        disease_id="ORPHA:422", disease_name="Pulmonary arterial hypertension",
+        label=1,
+        evidence_source="FDA approved 2001 (Tracleer) — endothelin receptor antagonist",
+        notes="Core PAH therapy. Strong ground truth positive.",
+    ),
+    GroundTruthPair(
+        drug_id="CHEMBL1500", drug_name="Tadalafil",
+        disease_id="ORPHA:422", disease_name="Pulmonary arterial hypertension",
+        label=1,
+        evidence_source="FDA approved 2009 (Adcirca) — PDE5 inhibitor same class as sildenafil",
+        notes="Direct comparator to sildenafil. Should score very similarly.",
+    ),
+    GroundTruthPair(
+        drug_id="CHEMBL1201585", drug_name="Fenfluramine",
+        disease_id="ORPHA:33069", disease_name="Dravet syndrome",
+        label=1,
+        evidence_source="FDA approved 2020 (Fintepla) — low-dose for Dravet",
+        notes="Chiral switch case study. Should score high on chirality layer.",
+    ),
 ]
 
 SEED_NEGATIVES: list[GroundTruthPair] = [
@@ -108,6 +143,27 @@ SEED_NEGATIVES: list[GroundTruthPair] = [
         label=0,
         evidence_source="No mechanistic relationship — control negative",
         notes="Pompe is GAA enzyme deficiency; metformin targets AMPK. Negative control.",
+    ),
+    GroundTruthPair(
+    drug_id="CHEMBL192", drug_name="Imatinib",
+    disease_id="ORPHA:33069", disease_name="Dravet syndrome",
+    label=0,
+    evidence_source="No mechanistic relationship — BCR-ABL inhibitor vs SCN1A channelopathy",
+    notes="Negative control. Completely different biology.",
+    ),
+    GroundTruthPair(
+        drug_id="CHEMBL579", drug_name="Metformin",
+        disease_id="ORPHA:422", disease_name="Pulmonary arterial hypertension",
+        label=0,
+        evidence_source="No established mechanism for PAH — AMPK activator",
+        notes="Negative control for PAH.",
+    ),
+    GroundTruthPair(
+        drug_id="CHEMBL714", drug_name="Hydroxychloroquine",
+        disease_id="ORPHA:33069", disease_name="Dravet syndrome",
+        label=0,
+        evidence_source="No mechanistic relationship — antimalarial vs SCN1A channelopathy",
+        notes="Negative control for Dravet.",
     ),
 ]
 

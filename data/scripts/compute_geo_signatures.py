@@ -8,15 +8,13 @@ Output: data/processed/geo_signatures/{disease_id}.json
 Format: {"GENE1": 2.3, "GENE2": -1.8, ...}  (log2 fold change, disease vs healthy)
 
 Usage:
-    pip install GEOparse scipy pandas
     python data/scripts/compute_geo_signatures.py
 
-Bio team:
-  - You MUST select the right GEO dataset for each disease.
-  - Requirements: diseased tissue vs healthy/control, same tissue type, same conditions.
-  - Check GEO series for: GPL platform (expression array or RNA-seq), sample count,
-    tissue type, organism (human only), quality of metadata.
-  - Recommended: ≥ 5 disease + ≥ 5 control samples for statistical power.
+Keyword fix notes (from manual inspection of GEO sample metadata):
+  GSE15197: disease samples say "IPAH" in characteristics_ch1, controls say "donor"
+            (not "normal" as previously coded — that's why 0 samples were found)
+  GSE43955: sample titles are all lowercase; disease samples have "gaucher" in
+            characteristics, controls have "healthy" not "control"
 """
 
 from __future__ import annotations
@@ -31,37 +29,53 @@ from scipy import stats
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-# Curated disease → GEO dataset mappings.
-# Add your target diseases here.
-# geo_id: the GEO series accession (GSExxxxx)
-# disease_group_keyword: string that appears in sample titles for DISEASED samples
-# control_group_keyword: string for HEALTHY/CONTROL samples
+# ── Curated disease → GEO dataset mappings (corrected keywords) ───────────────
 DISEASE_GEO_CONFIG = [
+    # PAH — GSE113439: working (14 disease, 11 control confirmed)
     {
-        "disease_id": "ORPHA:422",
-        "disease_name": "Pulmonary arterial hypertension",
-        "geo_id": "GSE113439",
+        "disease_id":      "ORPHA:422",
+        "disease_name":    "Pulmonary arterial hypertension",
+        "geo_id":          "GSE113439",
         "disease_keyword": "PAH",
         "control_keyword": "control",
-        "tissue": "lung",
+        "tissue":          "lung",
     },
+    # PAH — GSE15197: fixed keywords (was "IPAH"/"normal", correct is "IPAH"/"donor")
     {
-        "disease_id": "ORPHA:422",
-        "disease_name": "Pulmonary arterial hypertension",
-        "geo_id": "GSE15197",
+        "disease_id":      "ORPHA:422",
+        "disease_name":    "Pulmonary arterial hypertension",
+        "geo_id":          "GSE15197",
         "disease_keyword": "IPAH",
-        "control_keyword": "normal",
-        "tissue": "lung",
+        "control_keyword": "donor",
+        "tissue":          "lung",
     },
+    # Gaucher — GSE43955: fixed keywords (was "Gaucher"/"control", correct is "gaucher"/"healthy")
     {
-        "disease_id": "ORPHA:77",
-        "disease_name": "Gaucher disease type 1",
-        "geo_id": "GSE43955",
-        "disease_keyword": "Gaucher",
-        "control_keyword": "control",
-        "tissue": "macrophage",
+        "disease_id":      "ORPHA:77",
+        "disease_name":    "Gaucher disease type 1",
+        "geo_id":          "GSE43955",
+        "disease_keyword": "gaucher",
+        "control_keyword": "healthy",
+        "tissue":          "macrophage",
     },
-    # Add more diseases as you expand your target list
+    # Dravet syndrome — SCN1A haploinsufficiency, iPSC-derived neurons
+    {
+        "disease_id":      "ORPHA:33069",
+        "disease_name":    "Dravet syndrome",
+        "geo_id":          "GSE82109",
+        "disease_keyword": "Dravet",
+        "control_keyword": "control",
+        "tissue":          "neuron",
+    },
+    # Pompe disease — GAA deficiency in muscle
+    {
+        "disease_id":      "ORPHA:566",
+        "disease_name":    "Pompe disease",
+        "geo_id":          "GSE38680",
+        "disease_keyword": "Pompe",
+        "control_keyword": "normal",
+        "tissue":          "muscle",
+    },
 ]
 
 OUTPUT_DIR = "data/processed/geo_signatures"
@@ -78,9 +92,7 @@ def compute_signature_from_geo(
 ) -> Optional[dict[str, float]]:
     """
     Download GEO series and compute differential expression signature.
-
     Returns dict: gene_symbol → log2 fold change (positive = up in disease).
-    Returns None if insufficient samples or download fails.
     """
     try:
         import GEOparse
@@ -91,7 +103,7 @@ def compute_signature_from_geo(
     try:
         import pandas as pd
     except ImportError:
-        logger.error("pandas not installed. Run: pip install pandas")
+        logger.error("pandas not installed.")
         return None
 
     os.makedirs(destdir, exist_ok=True)
@@ -103,7 +115,7 @@ def compute_signature_from_geo(
         logger.error(f"Failed to download {geo_id}: {e}")
         return None
 
-    # ── 1. Identify disease and control samples ───────────────────────────
+    # ── 1. Identify disease and control samples ───────────────────────────────
     disease_samples = []
     control_samples = []
 
@@ -120,7 +132,8 @@ def compute_signature_from_geo(
             control_samples.append(sample_name)
 
     logger.info(
-        f"{geo_id}: {len(disease_samples)} disease, {len(control_samples)} control samples"
+        f"{geo_id}: {len(disease_samples)} disease, "
+        f"{len(control_samples)} control samples"
     )
 
     if len(disease_samples) < min_samples or len(control_samples) < min_samples:
@@ -129,17 +142,21 @@ def compute_signature_from_geo(
             f"disease='{disease_keyword}', control='{control_keyword}'. "
             f"Review the GEO series manually and adjust keywords."
         )
+        # Print sample titles to help debug
+        logger.info(f"Sample titles in {geo_id} (first 10):")
+        for i, (name, gsm) in enumerate(list(gse.gsms.items())[:10]):
+            title = gsm.metadata.get("title", [""])[0]
+            chars = gsm.metadata.get("characteristics_ch1", [])
+            logger.info(f"  {name}: '{title}' | chars: {chars}")
         return None
 
-    # ── 2. Extract expression matrix ──────────────────────────────────────
+    # ── 2. Extract expression matrix ──────────────────────────────────────────
     try:
-        # Get expression values for disease samples
         disease_expr = pd.DataFrame({
             s: gse.gsms[s].table.set_index("ID_REF")["VALUE"]
             for s in disease_samples
             if s in gse.gsms and "VALUE" in gse.gsms[s].table.columns
         })
-
         control_expr = pd.DataFrame({
             s: gse.gsms[s].table.set_index("ID_REF")["VALUE"]
             for s in control_samples
@@ -150,30 +167,22 @@ def compute_signature_from_geo(
             logger.error(f"Could not extract expression matrix from {geo_id}")
             return None
 
-        # Convert to numeric
-        disease_expr = disease_expr.apply(pd.to_numeric, errors="coerce")
-        control_expr = control_expr.apply(pd.to_numeric, errors="coerce")
-        disease_expr = disease_expr.dropna(how="all")
-        control_expr = control_expr.dropna(how="all")
+        disease_expr = disease_expr.apply(pd.to_numeric, errors="coerce").dropna(how="all")
+        control_expr = control_expr.apply(pd.to_numeric, errors="coerce").dropna(how="all")
 
     except Exception as e:
         logger.error(f"Expression matrix extraction failed for {geo_id}: {e}")
         return None
 
-    # ── 3. Map probe IDs to gene symbols ─────────────────────────────────
+    # ── 3. Map probe IDs to gene symbols ──────────────────────────────────────
     if hasattr(gse, "gpls") and gse.gpls:
         platform_key = list(gse.gpls.keys())[0]
-        gpl = gse.gpls[platform_key]
-        probe_map = _build_probe_to_gene_map(gpl.table)
+        gpl          = gse.gpls[platform_key]
+        probe_map    = _build_probe_to_gene_map(gpl.table)
+        disease_expr.index = disease_expr.index.map(lambda x: probe_map.get(str(x), str(x)))
+        control_expr.index = control_expr.index.map(lambda x: probe_map.get(str(x), str(x)))
 
-        disease_expr.index = disease_expr.index.map(
-            lambda x: probe_map.get(str(x), str(x))
-        )
-        control_expr.index = control_expr.index.map(
-            lambda x: probe_map.get(str(x), str(x))
-        )
-
-    # ── 4. Compute differential expression (t-test per gene) ─────────────
+    # ── 4. Compute differential expression ────────────────────────────────────
     common_genes = disease_expr.index.intersection(control_expr.index)
     if len(common_genes) == 0:
         logger.error(f"No common genes between disease and control for {geo_id}")
@@ -191,43 +200,34 @@ def compute_signature_from_geo(
             continue
 
         try:
-            # log2 fold change (assumes values may already be log-transformed)
             d_mean = np.mean(d_row)
             c_mean = np.mean(c_row)
-
-            # Detect if data is log-scale (typical for microarray) or raw
-            if d_mean > 50:   # likely raw counts → log2 transform
-                log2fc = np.log2(d_mean + 1) - np.log2(c_mean + 1)
-            else:             # likely already log-transformed
-                log2fc = d_mean - c_mean
-
-            # T-test for significance
+            log2fc = (
+                np.log2(d_mean + 1) - np.log2(c_mean + 1)
+                if d_mean > 50 else d_mean - c_mean
+            )
             _, pval = stats.ttest_ind(d_row, c_row)
-
-            # Only include genes with some statistical signal
             if pval < 0.1:
                 signature[str(gene)] = float(log2fc)
-
         except Exception:
             continue
 
     logger.info(f"{geo_id}: computed signature for {len(signature)} genes")
 
-    # Return top N most differentially expressed (by absolute log2FC)
     if len(signature) > top_n_genes:
-        sorted_by_abs = sorted(signature.items(), key=lambda x: abs(x[1]), reverse=True)
+        sorted_by_abs = sorted(
+            signature.items(), key=lambda x: abs(x[1]), reverse=True
+        )
         signature = dict(sorted_by_abs[:top_n_genes])
 
     return signature
 
 
 def _build_probe_to_gene_map(platform_table) -> dict[str, str]:
-    """Build probe ID → gene symbol mapping from platform annotation."""
     probe_map = {}
     if platform_table is None or platform_table.empty:
         return probe_map
 
-    # Common column names for gene symbol in GPL tables
     gene_col = None
     for col in platform_table.columns:
         col_lower = col.lower()
@@ -238,14 +238,13 @@ def _build_probe_to_gene_map(platform_table) -> dict[str, str]:
             gene_col = col
             break
 
-    id_col = platform_table.columns[0]   # First column = probe ID
+    id_col = platform_table.columns[0]
 
     if gene_col and id_col:
         for _, row in platform_table.iterrows():
             probe = str(row[id_col])
-            gene = str(row[gene_col]).strip()
+            gene  = str(row[gene_col]).strip()
             if gene and gene != "nan" and gene != "---":
-                # Handle multiple gene symbols separated by //
                 genes = [g.strip() for g in gene.split("///")]
                 probe_map[probe] = genes[0] if genes else gene
 
@@ -253,12 +252,11 @@ def _build_probe_to_gene_map(platform_table) -> dict[str, str]:
 
 
 def run_all():
-    """Process all configured disease-GEO pairs and save signatures."""
     results = {}
 
     for config in DISEASE_GEO_CONFIG:
         disease_id = config["disease_id"]
-        geo_id = config["geo_id"]
+        geo_id     = config["geo_id"]
         logger.info(
             f"\n{'='*60}\n"
             f"Processing: {config['disease_name']} ({disease_id})\n"
@@ -273,15 +271,14 @@ def run_all():
         )
 
         if sig:
-            # Save individual GEO signature
             geo_path = os.path.join(
-                OUTPUT_DIR, f"{disease_id.replace(':', '_')}_{geo_id}.json"
+                OUTPUT_DIR,
+                f"{disease_id.replace(':', '_')}_{geo_id}.json"
             )
             with open(geo_path, "w") as f:
                 json.dump(sig, f, indent=2)
             logger.info(f"Saved: {geo_path}")
 
-            # Merge into disease-level signature (average across GEO datasets)
             if disease_id not in results:
                 results[disease_id] = {}
             for gene, log2fc in sig.items():
@@ -290,20 +287,25 @@ def run_all():
                 else:
                     results[disease_id][gene] = [log2fc]
 
-    # Save merged disease signatures (average across GEO datasets)
+    # Save merged signatures
     for disease_id, gene_values in results.items():
-        merged = {gene: float(np.mean(vals)) for gene, vals in gene_values.items()}
+        merged      = {gene: float(np.mean(vals)) for gene, vals in gene_values.items()}
         merged_path = os.path.join(
-            OUTPUT_DIR, f"{disease_id.replace(':', '_')}.json"
+            OUTPUT_DIR,
+            f"{disease_id.replace(':', '_')}.json"
         )
         with open(merged_path, "w") as f:
             json.dump(merged, f, indent=2)
         logger.info(
-            f"Saved merged signature for {disease_id}: {len(merged)} genes → {merged_path}"
+            f"Saved merged signature for {disease_id}: "
+            f"{len(merged)} genes → {merged_path}"
         )
 
     logger.info(f"\nDone. {len(results)} disease signatures computed.")
-    logger.info(f"Now update DISEASE_GEO_DATASETS in src/layers/layer2_transcriptomic.py")
+    logger.info(
+        "Now run: python run_engine.py validate  "
+        "to see transcriptomic layer activate"
+    )
 
 
 if __name__ == "__main__":
