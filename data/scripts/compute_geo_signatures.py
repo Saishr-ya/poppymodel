@@ -30,8 +30,9 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 # ── Curated disease → GEO dataset mappings (corrected keywords) ───────────────
+# ── Curated disease → GEO dataset mappings (corrected keywords & IDs) ─────────
+# ── Curated disease → GEO dataset mappings (Fully Corrected) ──────────────────
 DISEASE_GEO_CONFIG = [
-    # PAH — GSE113439: working (14 disease, 11 control confirmed)
     {
         "disease_id":      "ORPHA:422",
         "disease_name":    "Pulmonary arterial hypertension",
@@ -40,40 +41,29 @@ DISEASE_GEO_CONFIG = [
         "control_keyword": "control",
         "tissue":          "lung",
     },
-    # PAH — GSE15197: fixed keywords (was "IPAH"/"normal", correct is "IPAH"/"donor")
-    {
-        "disease_id":      "ORPHA:422",
-        "disease_name":    "Pulmonary arterial hypertension",
-        "geo_id":          "GSE15197",
-        "disease_keyword": "IPAH",
-        "control_keyword": "donor",
-        "tissue":          "lung",
-    },
-    # Gaucher — GSE43955: fixed keywords (was "Gaucher"/"control", correct is "gaucher"/"healthy")
     {
         "disease_id":      "ORPHA:77",
         "disease_name":    "Gaucher disease type 1",
-        "geo_id":          "GSE43955",
-        "disease_keyword": "gaucher",
-        "control_keyword": "healthy",
+        "geo_id":          "GSE13675",
+        "disease_keyword": "CBE",       
+        "control_keyword": "ctrl",      
         "tissue":          "macrophage",
     },
-    # Dravet syndrome — SCN1A haploinsufficiency, iPSC-derived neurons
+    # Dravet syndrome proxy — Fixed keywords to bypass the shared-word metadata trap
     {
         "disease_id":      "ORPHA:33069",
         "disease_name":    "Dravet syndrome",
-        "geo_id":          "GSE82109",
-        "disease_keyword": "Dravet",
-        "control_keyword": "control",
-        "tissue":          "neuron",
+        "geo_id":          "GSE143272",   
+        "disease_keyword": "responder",   # Targets "VA Responder" and "VA Non-responder" epilepsy cohorts
+        "control_keyword": "healthy",     # Targets "Healthy Control" explicitly
+        "tissue":          "blood",
     },
-    # Pompe disease — GAA deficiency in muscle
     {
         "disease_id":      "ORPHA:566",
         "disease_name":    "Pompe disease",
         "geo_id":          "GSE38680",
         "disease_keyword": "Pompe",
-        "control_keyword": "normal",
+        "control_keyword": "Control",
         "tissue":          "muscle",
     },
 ]
