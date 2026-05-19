@@ -7,14 +7,8 @@ Run this ONCE per disease before using Layer 2 (transcriptomics).
 Output: data/processed/geo_signatures/{disease_id}.json
 Format: {"GENE1": 2.3, "GENE2": -1.8, ...}  (log2 fold change, disease vs healthy)
 
-Usage:
-    python data/scripts/compute_geo_signatures.py
-
-Keyword fix notes (from manual inspection of GEO sample metadata):
-  GSE15197: disease samples say "IPAH" in characteristics_ch1, controls say "donor"
-            (not "normal" as previously coded — that's why 0 samples were found)
-  GSE43955: sample titles are all lowercase; disease samples have "gaucher" in
-            characteristics, controls have "healthy" not "control"
+Refactored to use a format-agnostic matrix pivot approach and included an
+automated platform type router to flag and separate RNA-Seq data.
 """
 
 from __future__ import annotations
@@ -29,9 +23,7 @@ from scipy import stats
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-# ── Curated disease → GEO dataset mappings (corrected keywords) ───────────────
-# ── Curated disease → GEO dataset mappings (corrected keywords & IDs) ─────────
-# ── Curated disease → GEO dataset mappings (Fully Corrected) ──────────────────
+# ── Curated disease → GEO dataset mappings ────────────────────────────────────
 DISEASE_GEO_CONFIG = [
     {
         "disease_id":      "ORPHA:422",
@@ -49,13 +41,12 @@ DISEASE_GEO_CONFIG = [
         "control_keyword": "ctrl",      
         "tissue":          "macrophage",
     },
-    # Dravet syndrome proxy — Fixed keywords to bypass the shared-word metadata trap
     {
         "disease_id":      "ORPHA:33069",
         "disease_name":    "Dravet syndrome",
         "geo_id":          "GSE143272",   
-        "disease_keyword": "responder",   # Targets "VA Responder" and "VA Non-responder" epilepsy cohorts
-        "control_keyword": "healthy",     # Targets "Healthy Control" explicitly
+        "disease_keyword": "responder",   
+        "control_keyword": "healthy",     
         "tissue":          "blood",
     },
     {
@@ -72,6 +63,18 @@ OUTPUT_DIR = "data/processed/geo_signatures"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+def _get_sample_meta(gse, gsm_id: str) -> str:
+    """Helper function to cleanly extract and combine title and characteristics for a GSM sample."""
+    gsm = gse.gsms.get(gsm_id)
+    if not gsm:
+        return ""
+    title = gsm.metadata.get("title", [""])[0].lower()
+    characteristics = " ".join(
+        str(c) for cs in gsm.metadata.get("characteristics_ch1", []) for c in [cs]
+    ).lower()
+    return f"{title} {characteristics}"
+
+
 def compute_signature_from_geo(
     geo_id: str,
     disease_keyword: str,
@@ -82,22 +85,17 @@ def compute_signature_from_geo(
 ) -> Optional[dict[str, float]]:
     """
     Download GEO series and compute differential expression signature.
-    Returns dict: gene_symbol → log2 fold change (positive = up in disease).
+    Uses format-agnostic matrix pivots for microarrays and routes sequencing tracks away safely.
     """
     try:
         import GEOparse
-    except ImportError:
-        logger.error("GEOparse not installed. Run: pip install GEOparse")
-        return None
-
-    try:
         import pandas as pd
-    except ImportError:
-        logger.error("pandas not installed.")
+    except ImportError as e:
+        logger.error(f"Required package missing: {e}")
         return None
 
     os.makedirs(destdir, exist_ok=True)
-    logger.info(f"Downloading GEO series {geo_id}...")
+    logger.info(f"Downloading/loading GEO series {geo_id}...")
 
     try:
         gse = GEOparse.get_GEO(geo=geo_id, destdir=destdir, silent=True)
@@ -105,70 +103,46 @@ def compute_signature_from_geo(
         logger.error(f"Failed to download {geo_id}: {e}")
         return None
 
-    # ── 1. Identify disease and control samples ───────────────────────────────
-    disease_samples = []
-    control_samples = []
-
-    for sample_name, gsm in gse.gsms.items():
-        title = gsm.metadata.get("title", [""])[0].lower()
-        characteristics = " ".join(
-            c for cs in gsm.metadata.get("characteristics_ch1", []) for c in [cs]
-        ).lower()
-        combined = f"{title} {characteristics}"
-
-        if disease_keyword.lower() in combined:
-            disease_samples.append(sample_name)
-        elif control_keyword.lower() in combined:
-            control_samples.append(sample_name)
-
-    logger.info(
-        f"{geo_id}: {len(disease_samples)} disease, "
-        f"{len(control_samples)} control samples"
-    )
-
-    if len(disease_samples) < min_samples or len(control_samples) < min_samples:
-        logger.warning(
-            f"Insufficient samples in {geo_id} with keywords "
-            f"disease='{disease_keyword}', control='{control_keyword}'. "
-            f"Review the GEO series manually and adjust keywords."
-        )
-        # Print sample titles to help debug
-        logger.info(f"Sample titles in {geo_id} (first 10):")
-        for i, (name, gsm) in enumerate(list(gse.gsms.items())[:10]):
-            title = gsm.metadata.get("title", [""])[0]
-            chars = gsm.metadata.get("characteristics_ch1", [])
-            logger.info(f"  {name}: '{title}' | chars: {chars}")
+    # ── 1. Platform Ingestion & Technology Type Routing ───────────────────────
+    try:
+        gpl_id = list(gse.gpls.keys())[0]
+        platform_type = gse.gpls[gpl_id].metadata.get("technology", [""])[0]
+        
+        if "sequencing" in platform_type.lower() or "rna-seq" in platform_type.lower():
+            logger.warning(f"⚠️ {geo_id} is RNA-Seq — supplementary counts matrix download required. Handling separately.")
+            return None
+            
+        # Microarray Path: Pull pre-compiled expression grid using optimized pivot call
+        full_matrix = gse.pivot_samples("VALUE")
+        
+    except Exception as e:
+        logger.error(f"Failed parsing platform layout for {geo_id}: {e}")
         return None
 
-    # ── 2. Extract expression matrix ──────────────────────────────────────────
-    try:
-        disease_expr = pd.DataFrame({
-            s: gse.gsms[s].table.set_index("ID_REF")["VALUE"]
-            for s in disease_samples
-            if s in gse.gsms and "VALUE" in gse.gsms[s].table.columns
-        })
-        control_expr = pd.DataFrame({
-            s: gse.gsms[s].table.set_index("ID_REF")["VALUE"]
-            for s in control_samples
-            if s in gse.gsms and "VALUE" in gse.gsms[s].table.columns
-        })
+    # ── 2. Vectorized Condition Sorting via Meta Matching ────────────────────
+    disease_cols = [c for c in full_matrix.columns if disease_keyword.lower() in _get_sample_meta(gse, c)]
+    control_cols = [c for c in full_matrix.columns if control_keyword.lower() in _get_sample_meta(gse, c)]
 
-        if disease_expr.empty or control_expr.empty:
-            logger.error(f"Could not extract expression matrix from {geo_id}")
-            return None
+    logger.info(f"{geo_id}: {len(disease_cols)} disease, {len(control_cols)} control samples verified via matrix pivot.")
 
-        disease_expr = disease_expr.apply(pd.to_numeric, errors="coerce").dropna(how="all")
-        control_expr = control_expr.apply(pd.to_numeric, errors="coerce").dropna(how="all")
+    if len(disease_cols) < min_samples or len(control_cols) < min_samples:
+        logger.warning(
+            f"Insufficient cohorts matched inside {geo_id} for keywords: "
+            f"disease='{disease_keyword}', control='{control_keyword}'."
+        )
+        return None
 
-    except Exception as e:
-        logger.error(f"Expression matrix extraction failed for {geo_id}: {e}")
+    # Slice expression profiles out of our comprehensive data frame
+    disease_expr = full_matrix[disease_cols].apply(pd.to_numeric, errors="coerce").dropna(how="all")
+    control_expr = full_matrix[control_cols].apply(pd.to_numeric, errors="coerce").dropna(how="all")
+
+    if disease_expr.empty or control_expr.empty:
+        logger.error(f"Resulting data slices were completely empty for matrix calculation on {geo_id}")
         return None
 
     # ── 3. Map probe IDs to gene symbols ──────────────────────────────────────
     if hasattr(gse, "gpls") and gse.gpls:
-        platform_key = list(gse.gpls.keys())[0]
-        gpl          = gse.gpls[platform_key]
-        probe_map    = _build_probe_to_gene_map(gpl.table)
+        probe_map = _build_probe_to_gene_map(gse.gpls[gpl_id].table)
         disease_expr.index = disease_expr.index.map(lambda x: probe_map.get(str(x), str(x)))
         control_expr.index = control_expr.index.map(lambda x: probe_map.get(str(x), str(x)))
 
@@ -185,6 +159,10 @@ def compute_signature_from_geo(
     for gene in common_genes:
         d_row = disease_vals.loc[gene].dropna().values
         c_row = control_vals.loc[gene].dropna().values
+
+        # If duplicate mappings exist for a gene, treat arrays uniformly
+        if d_row.ndim > 1: d_row = d_row.flatten()
+        if c_row.ndim > 1: c_row = c_row.flatten()
 
         if len(d_row) < 2 or len(c_row) < 2:
             continue
@@ -292,10 +270,6 @@ def run_all():
         )
 
     logger.info(f"\nDone. {len(results)} disease signatures computed.")
-    logger.info(
-        "Now run: python run_engine.py validate  "
-        "to see transcriptomic layer activate"
-    )
 
 
 if __name__ == "__main__":
