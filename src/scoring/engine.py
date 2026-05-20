@@ -37,6 +37,7 @@ from src.layers.layer4_admet import ADMETLayer
 from src.layers.layer5_literature import LiteratureLayer
 from src.layers.layer6_business import BusinessLayer, BusinessScoreConfig
 from src.layers.layer_pgx import SouthAsianPGxLayer
+from src.layers.layer_ddi import DDILayer
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class EngineConfig:
     enable_layer5_literature: bool = True
     enable_layer6_business: bool = True
     enable_layer_pgx: bool = True
+    enable_layer_ddi: bool = True
 
     business_overrides: dict[str, BusinessScoreConfig] = field(default_factory=dict)
     composite_weights: Optional[dict[str, float]] = None
@@ -111,6 +113,9 @@ class ScoringEngine:
             )
             logger.info("Layer 6 (Business) enabled")
 
+        if cfg.enable_layer_ddi:
+            layers.append(DDILayer(config=layer_cfg))
+            logger.info("DDI layer enabled")
         if cfg.enable_layer_pgx:
             layers.append(SouthAsianPGxLayer(config=layer_cfg))
             logger.info("PGx (South Asian) layer enabled")

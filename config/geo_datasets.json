@@ -1,0 +1,45 @@
+{
+  "_comment": "GEO dataset configuration for transcriptomic signature computation. Add new diseases here without touching pipeline code.",
+  "_schema": {
+    "geo_id": "GEO Series accession (GSExxxxx)",
+    "disease_id": "Orphanet ID (ORPHA:xxx)",
+    "disease_name": "Human-readable disease name",
+    "case_keywords": "List of strings to match in sample metadata for CASE samples (case-insensitive)",
+    "control_keywords": "List of strings to match in sample metadata for CONTROL samples (case-insensitive)",
+    "notes": "Optional: platform quirks, caveats, or data source notes"
+  },
+  "datasets": [
+    {
+      "geo_id": "GSE113439",
+      "disease_id": "ORPHA:422",
+      "disease_name": "Pulmonary arterial hypertension",
+      "case_keywords": ["pah", "pulmonary arterial hypertension", "patient"],
+      "control_keywords": ["control", "healthy", "normal", "donor"],
+      "notes": "Microarray, Affymetrix HG-U133 Plus 2.0"
+    },
+    {
+      "geo_id": "GSE13675",
+      "disease_id": "ORPHA:77",
+      "disease_name": "Gaucher disease type 1",
+      "case_keywords": ["gaucher", "gd", "type 1"],
+      "control_keywords": ["control", "healthy", "normal"],
+      "notes": "Microarray"
+    },
+    {
+      "geo_id": "GSE143272",
+      "disease_id": "ORPHA:33069",
+      "disease_name": "Dravet syndrome",
+      "case_keywords": ["dravet", "scn1a", "patient"],
+      "control_keywords": ["control", "healthy", "normal", "wildtype", "wt"],
+      "notes": "Microarray"
+    },
+    {
+      "geo_id": "GSE38680",
+      "disease_id": "ORPHA:566",
+      "disease_name": "Pompe disease",
+      "case_keywords": ["pompe", "gaa", "glycogen storage"],
+      "control_keywords": ["control", "healthy", "normal"],
+      "notes": "Microarray"
+    }
+  ]
+}

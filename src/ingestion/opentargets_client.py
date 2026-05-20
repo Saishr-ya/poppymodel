@@ -3,12 +3,16 @@ src/ingestion/opentargets_client.py
 
 OpenTargets Platform API client.
 
-Seed map fix: corrected EFO IDs for Dravet syndrome and Microcephaly.
-  ORPHA:33069 (Dravet)       → MONDO_0100135  (was EFO_0009897 — didn't exist)
-  ORPHA:101435 (Microcephaly)→ MONDO_0015469  (was EFO_0000354 — didn't exist)
+Fix #13: Removed hardcoded _SEED_EFO_MAP entirely. The map was a source of
+         silent bugs (e.g. ORPHA:422 mapped to EFO_0000222 = AML, not PAH).
+         All disease IDs now go through _dynamic_efo_lookup(), which is
+         cached for 365 days — so after the first run it's as fast as the
+         seed map was, with no maintenance burden.
 
-Note: OpenTargets uses both EFO_ and MONDO_ prefixes. MONDO IDs work
-directly in the disease(efoId: ...) query.
+Previous fixes:
+  ORPHA:33069 (Dravet)        → MONDO_0100135 (was EFO_0009897)
+  ORPHA:101435 (Microcephaly) → MONDO_0015469 (was EFO_0000354)
+  ORPHA:422 (PAH)             → EFO_0001361   (was EFO_0000222 = AML)
 """
 
 from __future__ import annotations
@@ -33,18 +37,6 @@ HEADERS = {
 }
 
 DEFAULT_SCORE_THRESHOLD = 0.1
-
-# ── Verified seed map ─────────────────────────────────────────────────────────
-# All IDs verified against https://platform.opentargets.org/disease/<id>
-_SEED_EFO_MAP: dict[str, str] = {
-    "ORPHA:422":    "EFO_0000222",    # Pulmonary arterial hypertension
-    "ORPHA:77":     "EFO_0000182",    # Gaucher disease type 1
-    "ORPHA:33069":  "MONDO_0100135",  # Dravet syndrome (fixed: was EFO_0009897)
-    "ORPHA:566":    "EFO_0004249",    # Pompe disease
-    "ORPHA:355":    "EFO_0000339",    # Chronic myeloid leukaemia
-    "ORPHA:101435": "MONDO_0015469",  # Autosomal recessive primary microcephaly (fixed: was EFO_0000354)
-    "ORPHA:586":    "EFO_0004259",    # Polycystic ovary syndrome
-}
 
 # ── GraphQL queries ────────────────────────────────────────────────────────────
 
@@ -106,25 +98,34 @@ class OpenTargetsClient:
     def get_efo_id(self, disease_id: str) -> Optional[str]:
         """
         Resolve any Orphanet/OMIM ID to an OpenTargets EFO/MONDO ID.
-        Fast path: verified seed map. Slow path: dynamic API resolution.
+
+        Fix #13: No longer uses a hardcoded seed map. All IDs go through
+        _dynamic_efo_lookup(), which is cached for 365 days after first call.
         """
-        if disease_id in _SEED_EFO_MAP:
-            return _SEED_EFO_MAP[disease_id]
         return self._dynamic_efo_lookup(disease_id)
 
     @cached_api_call(ttl_seconds=86400 * 365)
     def _dynamic_efo_lookup(self, disease_id: str) -> Optional[str]:
-        """Resolve a novel disease ID dynamically via Orphanet name + OT search."""
+        """
+        Resolve a disease ID dynamically:
+          1. Fetch disease name from Orphanet API
+          2. Search OpenTargets by name + cross-reference match
+          3. Fall back to OLS4/MONDO xref lookup
+        Result is cached for 1 year.
+        """
         disease_name = self._get_disease_name(disease_id)
         if disease_name:
             result = self._search_ot_by_name(disease_id, disease_name)
             if result:
-                logger.info(f"Dynamically resolved {disease_id} → {result} (via name '{disease_name}')")
+                logger.info(
+                    f"Resolved {disease_id} → {result} (via name '{disease_name}')"
+                )
                 return result
 
         if disease_id.startswith("ORPHA:"):
             result = self._search_via_mondo(disease_id)
             if result:
+                logger.info(f"Resolved {disease_id} → {result} (via MONDO xref)")
                 return result
 
         logger.warning(f"OpenTargets: could not resolve EFO ID for {disease_id}")
@@ -149,18 +150,24 @@ class OpenTargetsClient:
             r = requests.post(
                 GRAPHQL_URL,
                 headers=HEADERS,
-                json={"query": _DISEASE_NAME_SEARCH_QUERY, "variables": {"query": disease_name}},
+                json={
+                    "query": _DISEASE_NAME_SEARCH_QUERY,
+                    "variables": {"query": disease_name},
+                },
                 timeout=20,
             )
             r.raise_for_status()
             rows = r.json().get("data", {}).get("diseases", {}).get("rows", [])
+            # Priority 1: exact xref match
             for row in rows:
                 if any(pat in str(x) for x in row.get("dbXRefs", []) for pat in xref_patterns):
                     return row["id"]
+            # Priority 2: name substring match
             name_lower = disease_name.lower()
             for row in rows:
                 if name_lower in row.get("name", "").lower():
                     return row["id"]
+            # Priority 3: first result
             if rows:
                 return rows[0]["id"]
         except Exception as e:
@@ -194,14 +201,23 @@ class OpenTargetsClient:
             r = requests.post(
                 GRAPHQL_URL,
                 headers=HEADERS,
-                json={"query": _BATCH_PROTEIN_IDS_QUERY, "variables": {"ids": list(ensembl_ids)}},
+                json={
+                    "query": _BATCH_PROTEIN_IDS_QUERY,
+                    "variables": {"ids": list(ensembl_ids)},
+                },
                 timeout=30,
             )
             r.raise_for_status()
             result = {}
             for target in r.json().get("data", {}).get("targets", []):
-                swissprot = [p["id"] for p in target.get("proteinIds", []) if p.get("source") == "uniprot_swissprot"]
-                trembl    = [p["id"] for p in target.get("proteinIds", []) if p.get("source") == "uniprot_trembl"]
+                swissprot = [
+                    p["id"] for p in target.get("proteinIds", [])
+                    if p.get("source") == "uniprot_swissprot"
+                ]
+                trembl = [
+                    p["id"] for p in target.get("proteinIds", [])
+                    if p.get("source") == "uniprot_trembl"
+                ]
                 result[target["id"]] = swissprot if swissprot else trembl
             return result
         except Exception as e:
@@ -219,7 +235,10 @@ class OpenTargetsClient:
             r = requests.post(
                 GRAPHQL_URL,
                 headers=HEADERS,
-                json={"query": _DISEASE_TARGETS_QUERY, "variables": {"efoId": efo_id, "size": limit}},
+                json={
+                    "query": _DISEASE_TARGETS_QUERY,
+                    "variables": {"efoId": efo_id, "size": limit},
+                },
                 timeout=30,
             )
             r.raise_for_status()
@@ -236,7 +255,9 @@ class OpenTargetsClient:
 
             rows = disease_data.get("associatedTargets", {}).get("rows", [])
             ensembl_ids = tuple(
-                row["target"]["id"] for row in rows if row.get("target", {}).get("id")
+                row["target"]["id"]
+                for row in rows
+                if row.get("target", {}).get("id")
             )
             uniprot_map = self._batch_uniprot_lookup(ensembl_ids)
 
@@ -245,16 +266,16 @@ class OpenTargetsClient:
                 score = float(row.get("score") or 0)
                 if score < self.score_threshold:
                     continue
-                target      = row.get("target", {})
-                ensembl_id  = target.get("id", "")
-                uniprot_ids = uniprot_map.get(ensembl_id, [])
+                target     = row.get("target", {})
+                ensembl_id = target.get("id", "")
                 evidence_types = [
-                    ds["id"] for ds in row.get("datatypeScores", []) if ds.get("score", 0) > 0
+                    ds["id"] for ds in row.get("datatypeScores", [])
+                    if ds.get("score", 0) > 0
                 ]
                 genes.append({
                     "gene_symbol":    target.get("approvedSymbol", ""),
                     "ensembl_id":     ensembl_id,
-                    "uniprot_ids":    uniprot_ids,
+                    "uniprot_ids":    uniprot_map.get(ensembl_id, []),
                     "ot_score":       score,
                     "evidence_types": evidence_types,
                     "source":         "OpenTargets",
@@ -282,7 +303,11 @@ class OpenTargetsClient:
         }
 
     def get_disease_gene_symbols(self, disease_id: str) -> set[str]:
-        return {g["gene_symbol"] for g in self.get_disease_genes(disease_id) if g.get("gene_symbol")}
+        return {
+            g["gene_symbol"]
+            for g in self.get_disease_genes(disease_id)
+            if g.get("gene_symbol")
+        }
 
     @cached_api_call(ttl_seconds=86400 * 30)
     def get_gene_diseases(self, gene_symbol: str, limit: int = 50) -> list[dict]:
@@ -303,21 +328,38 @@ class OpenTargetsClient:
         }
         """
         try:
-            r = requests.post(GRAPHQL_URL, headers=HEADERS,
-                              json={"query": search_q, "variables": {"q": gene_symbol}}, timeout=15)
+            r = requests.post(
+                GRAPHQL_URL, headers=HEADERS,
+                json={"query": search_q, "variables": {"q": gene_symbol}},
+                timeout=15,
+            )
             r.raise_for_status()
             targets = r.json().get("data", {}).get("targets", {}).get("rows", [])
             if not targets:
                 return []
             ensembl_id = targets[0]["id"]
             time.sleep(0.3)
-            r2 = requests.post(GRAPHQL_URL, headers=HEADERS,
-                               json={"query": gene_disease_q, "variables": {"id": ensembl_id, "size": limit}},
-                               timeout=20)
+            r2 = requests.post(
+                GRAPHQL_URL, headers=HEADERS,
+                json={"query": gene_disease_q, "variables": {"id": ensembl_id, "size": limit}},
+                timeout=20,
+            )
             r2.raise_for_status()
-            rows = r2.json().get("data", {}).get("target", {}).get("associatedDiseases", {}).get("rows", [])
-            return [{"disease_id": row["disease"]["id"], "disease_name": row["disease"]["name"],
-                     "score": row.get("score", 0), "source": "OpenTargets"} for row in rows]
+            rows = (
+                r2.json().get("data", {})
+                .get("target", {})
+                .get("associatedDiseases", {})
+                .get("rows", [])
+            )
+            return [
+                {
+                    "disease_id":   row["disease"]["id"],
+                    "disease_name": row["disease"]["name"],
+                    "score":        row.get("score", 0),
+                    "source":       "OpenTargets",
+                }
+                for row in rows
+            ]
         except Exception as e:
             logger.debug(f"get_gene_diseases({gene_symbol}) failed: {e}")
             return []

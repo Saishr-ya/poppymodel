@@ -1,276 +1,657 @@
+#!/usr/bin/env python3
 """
 data/scripts/compute_geo_signatures.py
 
-Pre-compute disease gene expression signatures from GEO datasets.
-Run this ONCE per disease before using Layer 2 (transcriptomics).
+Compute DEG signatures from GEO datasets for use in Layer 2 (Transcriptomic).
 
-Output: data/processed/geo_signatures/{disease_id}.json
-Format: {"GENE1": 2.3, "GENE2": -1.8, ...}  (log2 fold change, disease vs healthy)
+Fix #14: Removed hardcoded DISEASE_GEO_CONFIG array. Dataset configuration
+         is now loaded from config/geo_datasets.json. Add new diseases there
+         without touching this script.
 
-Refactored to use a format-agnostic matrix pivot approach and included an
-automated platform type router to flag and separate RNA-Seq data.
+Fix #15: Replaced fragile GPL column-name guessing with mygene-based probe
+         mapping. mygene translates any stable probe/Entrez/Ensembl ID to
+         a unified HGNC symbol, handling platform-specific header variations
+         automatically.
+
+Fix #16: Added 'discover' subcommand. Given a disease name and Orphanet ID,
+         searches NCBI GEO via Entrez API, scores candidate datasets by sample
+         count and metadata quality, auto-detects case/control keywords from
+         characteristics blocks, and writes confirmed entries to
+         config/geo_datasets.json.
+
+Usage:
+    python data/scripts/compute_geo_signatures.py                        # all datasets
+    python data/scripts/compute_geo_signatures.py GSE113439              # one dataset
+    python data/scripts/compute_geo_signatures.py --list                 # list configured
+    python data/scripts/compute_geo_signatures.py discover "Gaucher disease" ORPHA:77
 """
 
 from __future__ import annotations
+
+import argparse
 import json
 import logging
 import os
+import sys
+import time
+from collections import Counter
+from pathlib import Path
 from typing import Optional
 
+import GEOparse
+import mygene
 import numpy as np
+import pandas as pd
+import requests
 from scipy import stats
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-# ── Curated disease → GEO dataset mappings ────────────────────────────────────
-DISEASE_GEO_CONFIG = [
-    {
-        "disease_id":      "ORPHA:422",
-        "disease_name":    "Pulmonary arterial hypertension",
-        "geo_id":          "GSE113439",
-        "disease_keyword": "PAH",
-        "control_keyword": "control",
-        "tissue":          "lung",
-    },
-    {
-        "disease_id":      "ORPHA:77",
-        "disease_name":    "Gaucher disease type 1",
-        "geo_id":          "GSE13675",
-        "disease_keyword": "CBE",       
-        "control_keyword": "ctrl",      
-        "tissue":          "macrophage",
-    },
-    {
-        "disease_id":      "ORPHA:33069",
-        "disease_name":    "Dravet syndrome",
-        "geo_id":          "GSE143272",   
-        "disease_keyword": "responder",   
-        "control_keyword": "healthy",     
-        "tissue":          "blood",
-    },
-    {
-        "disease_id":      "ORPHA:566",
-        "disease_name":    "Pompe disease",
-        "geo_id":          "GSE38680",
-        "disease_keyword": "Pompe",
-        "control_keyword": "Control",
-        "tissue":          "muscle",
-    },
-]
+# ── Paths ──────────────────────────────────────────────────────────────────────
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH  = PROJECT_ROOT / "config" / "geo_datasets.json"
+OUTPUT_DIR   = PROJECT_ROOT / "data" / "processed" / "geo_signatures"
+CACHE_DIR    = PROJECT_ROOT / "data" / "raw" / "geo_cache"
 
-OUTPUT_DIR = "data/processed/geo_signatures"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+mg = mygene.MyGeneInfo()
+
+NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+NCBI_EFETCH  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+GEO_QUERY_URL = "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi"
+
+# Common control/case terms for auto-detection
+_CONTROL_TERMS = {
+    "control", "healthy", "normal", "donor", "wildtype", "wt",
+    "unaffected", "non-disease", "ctrl", "hc", "nd",
+}
+_CASE_TERMS = {
+    "patient", "disease", "affected", "case", "subject",
+    "diagnosed", "positive", "treated",  # treated is ambiguous but often case
+}
 
 
-def _get_sample_meta(gse, gsm_id: str) -> str:
-    """Helper function to cleanly extract and combine title and characteristics for a GSM sample."""
-    gsm = gse.gsms.get(gsm_id)
-    if not gsm:
-        return ""
-    title = gsm.metadata.get("title", [""])[0].lower()
-    characteristics = " ".join(
-        str(c) for cs in gsm.metadata.get("characteristics_ch1", []) for c in [cs]
-    ).lower()
-    return f"{title} {characteristics}"
+# ── Config loading ─────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {"datasets": []}
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
 
 
-def compute_signature_from_geo(
-    geo_id: str,
-    disease_keyword: str,
-    control_keyword: str,
-    min_samples: int = 3,
-    top_n_genes: int = 500,
-    destdir: str = "data/raw/geo",
-) -> Optional[dict[str, float]]:
+def save_config(cfg: dict):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def get_configured_geo_ids() -> set[str]:
+    return {d["geo_id"] for d in load_config().get("datasets", [])}
+
+
+# ── GEO discovery via NCBI Entrez ─────────────────────────────────────────────
+
+def search_geo_datasets(disease_name: str, max_results: int = 20) -> list[str]:
     """
-    Download GEO series and compute differential expression signature.
-    Uses format-agnostic matrix pivots for microarrays and routes sequencing tracks away safely.
+    Search NCBI GEO for expression datasets matching a disease name.
+    Returns list of GEO Series UIDs.
     """
+    query = (
+        f'"{disease_name}"[Title/Abstract] '
+        f'AND "expression profiling by array"[DataSet Type] '
+        f'AND "Homo sapiens"[Organism]'
+    )
     try:
-        import GEOparse
-        import pandas as pd
-    except ImportError as e:
-        logger.error(f"Required package missing: {e}")
+        r = requests.get(
+            NCBI_ESEARCH,
+            params={
+                "db": "gds",
+                "term": query,
+                "retmax": max_results,
+                "retmode": "json",
+                "usehistory": "n",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        ids = r.json().get("esearchresult", {}).get("idlist", [])
+        logger.info(f"NCBI GEO search '{disease_name}': {len(ids)} datasets found")
+        return ids
+    except Exception as e:
+        logger.error(f"NCBI GEO search failed: {e}")
+        return []
+
+
+def fetch_geo_summaries(uids: list[str]) -> list[dict]:
+    """Fetch GEO dataset summaries for a list of UIDs."""
+    if not uids:
+        return []
+    try:
+        r = requests.get(
+            NCBI_ESUMMARY,
+            params={
+                "db": "gds",
+                "id": ",".join(uids),
+                "retmode": "json",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        result = r.json().get("result", {})
+        return [result[uid] for uid in uids if uid in result]
+    except Exception as e:
+        logger.error(f"NCBI GEO summary fetch failed: {e}")
+        return []
+
+
+def score_dataset(summary: dict) -> tuple[float, dict]:
+    """
+    Score a GEO dataset summary for suitability.
+    Returns (score, info_dict).
+    Higher = better candidate.
+    """
+    score = 0.0
+    info = {
+        "geo_id":   summary.get("accession", ""),
+        "title":    summary.get("title", ""),
+        "n_samples": int(summary.get("n_samples", 0)),
+        "platform": summary.get("gpl", ""),
+        "summary":  summary.get("summary", "")[:200],
+    }
+
+    n = info["n_samples"]
+    # Sample count scoring — need at least 6 (3 per group)
+    if n >= 20:
+        score += 3.0
+    elif n >= 10:
+        score += 2.0
+    elif n >= 6:
+        score += 1.0
+    else:
+        score -= 5.0  # too small, heavily penalise
+
+    # Prefer datasets with "case" and "control" in summary
+    summary_lower = info["summary"].lower()
+    if "control" in summary_lower or "healthy" in summary_lower:
+        score += 1.0
+    if "patient" in summary_lower or "disease" in summary_lower:
+        score += 1.0
+
+    # Prefer human microarray platforms
+    platform = info["platform"].upper()
+    if platform.startswith("GPL"):
+        score += 0.5
+
+    return score, info
+
+
+def detect_case_control_keywords(geo_id: str) -> tuple[list[str], list[str]]:
+    """
+    Download a GEO series and extract case/control keywords from
+    characteristics_ch1 metadata blocks.
+
+    Returns (case_keywords, control_keywords).
+    """
+    logger.info(f"Downloading {geo_id} to detect sample groups...")
+    try:
+        gse = GEOparse.get_GEO(geo=geo_id, destdir=str(CACHE_DIR), silent=True)
+    except Exception as e:
+        logger.warning(f"Could not download {geo_id}: {e}")
+        return [], []
+
+    # Collect all characteristics values across all samples
+    all_values: list[str] = []
+    for gsm in gse.gsms.values():
+        for ch in gsm.metadata.get("characteristics_ch1", []):
+            parts = ch.split(":", 1)
+            val = parts[-1].strip().lower()
+            if val:
+                all_values.append(val)
+
+    if not all_values:
+        # Fall back to title metadata
+        for gsm in gse.gsms.values():
+            title = " ".join(gsm.metadata.get("title", [])).lower()
+            all_values.append(title)
+
+    # Count value frequencies
+    value_counts = Counter(all_values)
+    unique_values = [v for v, _ in value_counts.most_common(30)]
+
+    # Classify each unique value as case, control, or ambiguous
+    case_kw, control_kw = [], []
+    for val in unique_values:
+        val_words = set(val.replace("-", " ").replace("_", " ").split())
+        if val_words & _CONTROL_TERMS:
+            control_kw.append(val)
+        elif val_words & _CASE_TERMS:
+            case_kw.append(val)
+
+    # If we couldn't classify anything, return most frequent 2 values as candidates
+    if not case_kw and not control_kw and len(unique_values) >= 2:
+        logger.warning(
+            f"{geo_id}: could not auto-classify sample groups. "
+            f"Top values: {unique_values[:5]}"
+        )
+        return [], []
+
+    # Deduplicate and limit
+    case_kw    = list(dict.fromkeys(case_kw))[:5]
+    control_kw = list(dict.fromkeys(control_kw))[:5]
+
+    return case_kw, control_kw
+
+
+# ── Discover subcommand ────────────────────────────────────────────────────────
+
+def cmd_discover(disease_name: str, disease_id: str, auto_confirm: bool = False):
+    """
+    Search GEO for datasets matching a disease, score candidates,
+    auto-detect case/control keywords, and offer to add to config.
+    """
+    already_configured = get_configured_geo_ids()
+
+    print(f"\n🔍 Searching GEO for: {disease_name} ({disease_id})\n")
+
+    uids = search_geo_datasets(disease_name, max_results=20)
+    if not uids:
+        print("No datasets found. Try a different disease name spelling.")
+        return
+
+    summaries = fetch_geo_summaries(uids)
+    if not summaries:
+        print("Could not fetch dataset summaries.")
+        return
+
+    # Score and sort
+    scored = sorted(
+        [score_dataset(s) for s in summaries],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    # Filter: skip already configured, require ≥6 samples
+    candidates = [
+        (score, info) for score, info in scored
+        if info["geo_id"] not in already_configured
+        and info["n_samples"] >= 6
+    ][:5]  # top 5
+
+    if not candidates:
+        print("No new suitable datasets found (all already configured or too small).")
+        return
+
+    print(f"Top candidates for '{disease_name}':\n")
+    for i, (score, info) in enumerate(candidates, 1):
+        print(f"  [{i}] {info['geo_id']}  (score={score:.1f}, n={info['n_samples']} samples)")
+        print(f"      {info['title']}")
+        print(f"      {info['summary'][:120]}...")
+        print()
+
+    # For each candidate, detect keywords and present for confirmation
+    added = []
+    for score, info in candidates:
+        geo_id = info["geo_id"]
+        print(f"─── {geo_id} ───────────────────────────────────────────")
+
+        case_kw, control_kw = detect_case_control_keywords(geo_id)
+
+        if not case_kw or not control_kw:
+            print(f"  ⚠  Could not auto-detect case/control groups for {geo_id}.")
+            print(f"     You can add it manually to config/geo_datasets.json.")
+            print()
+            continue
+
+        print(f"  Auto-detected case keywords:    {case_kw}")
+        print(f"  Auto-detected control keywords: {control_kw}")
+        print()
+
+        if auto_confirm:
+            confirm = "y"
+        else:
+            confirm = input(f"  Add {geo_id} to config? [y/N/edit] ").strip().lower()
+
+        if confirm == "edit":
+            case_kw    = input("  Enter case keywords (comma-separated): ").split(",")
+            control_kw = input("  Enter control keywords (comma-separated): ").split(",")
+            case_kw    = [k.strip() for k in case_kw if k.strip()]
+            control_kw = [k.strip() for k in control_kw if k.strip()]
+            confirm    = "y"
+
+        if confirm == "y":
+            entry = {
+                "geo_id":           geo_id,
+                "disease_id":       disease_id,
+                "disease_name":     disease_name,
+                "case_keywords":    case_kw,
+                "control_keywords": control_kw,
+                "notes":            f"Auto-discovered. Title: {info['title'][:80]}",
+            }
+            cfg = load_config()
+            cfg.setdefault("datasets", []).append(entry)
+            save_config(cfg)
+            print(f"  ✓ Added {geo_id} to config/geo_datasets.json")
+            added.append(geo_id)
+        else:
+            print(f"  Skipped {geo_id}")
+        print()
+
+    if added:
+        print(f"\nAdded {len(added)} dataset(s): {added}")
+        print("Run the pipeline now?")
+        if auto_confirm or input("  Compute signatures now? [y/N] ").strip().lower() == "y":
+            datasets = load_config()["datasets"]
+            for d in datasets:
+                if d["geo_id"] in added:
+                    process_dataset(d)
+    else:
+        print("No datasets added.")
+
+
+# ── Probe → gene mapping via mygene ───────────────────────────────────────────
+
+def map_probes_to_genes(gpl) -> dict[str, str]:
+    """
+    Fix #15: Use mygene to map probe IDs → HGNC gene symbols.
+    Tries Entrez IDs first, then Ensembl, then direct symbol column.
+    """
+    table = gpl.table
+    if table is None or table.empty:
+        return {}
+
+    cols_lower = {c.lower(): c for c in table.columns}
+
+    # Try Entrez ID columns
+    entrez_col = next(
+        (cols_lower[k] for k in cols_lower
+         if k in ("entrez_gene_id", "entrez_id", "gene_id", "entrezid", "gene", "gb_acc")),
+        None,
+    )
+    if entrez_col:
+        ids = table[entrez_col].dropna().astype(str).str.strip()
+        ids = ids[ids.str.match(r'^\d+$')]
+        if len(ids) > 100:
+            logger.info(f"Mapping {len(ids)} probes via Entrez IDs using mygene")
+            try:
+                result = mg.querymany(
+                    ids.tolist(), scopes="entrezgene", fields="symbol",
+                    species="human", returnall=False, verbose=False,
+                )
+                entrez_to_symbol = {
+                    str(r["query"]): r["symbol"]
+                    for r in result if "symbol" in r and not r.get("notfound")
+                }
+                probe_to_gene = {}
+                for probe_id, entrez_id in zip(table.index, ids):
+                    sym = entrez_to_symbol.get(str(entrez_id))
+                    if sym:
+                        probe_to_gene[str(probe_id)] = sym
+                logger.info(f"mygene mapped {len(probe_to_gene)} probes via Entrez")
+                return probe_to_gene
+            except Exception as e:
+                logger.warning(f"mygene Entrez mapping failed: {e}")
+
+    # Try Ensembl ID columns
+    ensembl_col = next(
+        (cols_lower[k] for k in cols_lower if "ensembl" in k), None
+    )
+    if ensembl_col:
+        ids = table[ensembl_col].dropna().astype(str).str.strip()
+        ids = ids[ids.str.match(r'^ENSG\d+')]
+        if len(ids) > 100:
+            logger.info(f"Mapping {len(ids)} probes via Ensembl IDs using mygene")
+            try:
+                result = mg.querymany(
+                    ids.tolist(), scopes="ensembl.gene", fields="symbol",
+                    species="human", returnall=False, verbose=False,
+                )
+                ensembl_to_symbol = {
+                    r["query"]: r["symbol"]
+                    for r in result if "symbol" in r and not r.get("notfound")
+                }
+                probe_to_gene = {}
+                for probe_id, ensembl_id in zip(table.index, ids):
+                    sym = ensembl_to_symbol.get(str(ensembl_id))
+                    if sym:
+                        probe_to_gene[str(probe_id)] = sym
+                logger.info(f"mygene mapped {len(probe_to_gene)} probes via Ensembl")
+                return probe_to_gene
+            except Exception as e:
+                logger.warning(f"mygene Ensembl mapping failed: {e}")
+
+    # Last resort: direct symbol column
+    symbol_col = next(
+        (cols_lower[k] for k in cols_lower
+         if k in ("gene_symbol", "gene symbol", "symbol", "genesymbol",
+                  "gene_name", "ilmn_gene", "orf")),
+        None,
+    )
+    if symbol_col:
+        logger.info(f"Using direct symbol column '{symbol_col}'")
+        return {
+            str(probe): str(sym)
+            for probe, sym in zip(table.index, table[symbol_col])
+            if pd.notna(sym) and str(sym).strip()
+        }
+
+    logger.warning("No usable gene mapping column found in GPL table")
+    return {}
+
+
+# ── Sample stratification ──────────────────────────────────────────────────────
+
+def stratify_samples(
+    gse,
+    case_keywords: list[str],
+    control_keywords: list[str],
+) -> tuple[list[str], list[str]]:
+    """
+    Split GSM sample IDs into case and control groups.
+    Searches characteristics values only (not keys) to avoid false positives.
+    """
+    cases, controls = [], []
+    for gsm_id, gsm in gse.gsms.items():
+        char_values = []
+        for ch in gsm.metadata.get("characteristics_ch1", []):
+            parts = ch.split(":", 1)
+            char_values.append(parts[-1].lower().strip())
+        title  = " ".join(gsm.metadata.get("title", [])).lower()
+        source = " ".join(gsm.metadata.get("source_name_ch1", [])).lower()
+        search_text = " ".join(char_values) + " " + title + " " + source
+
+        if any(kw.lower() in search_text for kw in case_keywords):
+            cases.append(gsm_id)
+        elif any(kw.lower() in search_text for kw in control_keywords):
+            controls.append(gsm_id)
+
+    return cases, controls
+
+
+# ── DEG computation ────────────────────────────────────────────────────────────
+
+def compute_deg_signature(
+    gse,
+    case_ids: list[str],
+    control_ids: list[str],
+    probe_to_gene: dict[str, str],
+    min_samples: int = 3,
+) -> Optional[pd.DataFrame]:
+    try:
+        expr = gse.pivot_samples("VALUE")
+    except Exception as e:
+        logger.error(f"pivot_samples failed: {e}")
         return None
 
-    os.makedirs(destdir, exist_ok=True)
-    logger.info(f"Downloading/loading GEO series {geo_id}...")
+    case_cols    = [c for c in case_ids    if c in expr.columns]
+    control_cols = [c for c in control_ids if c in expr.columns]
+
+    if len(case_cols) < min_samples or len(control_cols) < min_samples:
+        logger.error(
+            f"Insufficient samples: {len(case_cols)} cases, "
+            f"{len(control_cols)} controls (need ≥{min_samples} each)"
+        )
+        return None
+
+    logger.info(f"Computing DEGs: {len(case_cols)} cases vs {len(control_cols)} controls")
+
+    expr.index = expr.index.astype(str)
+    expr["gene"] = expr.index.map(probe_to_gene)
+    expr = expr.dropna(subset=["gene"])
+    expr = expr.groupby("gene").mean()
+
+    case_data    = expr[case_cols].values.astype(float)
+    control_data = expr[control_cols].values.astype(float)
+
+    t_stats, p_values = stats.ttest_ind(
+        case_data, control_data, axis=1, equal_var=False, nan_policy="omit"
+    )
+    mean_case    = np.nanmean(case_data,    axis=1)
+    mean_control = np.nanmean(control_data, axis=1)
+    log2fc       = mean_case - mean_control
+
+    from statsmodels.stats.multitest import multipletests
+    valid_mask = ~np.isnan(p_values)
+    fdr = np.full_like(p_values, np.nan)
+    if valid_mask.sum() > 0:
+        _, fdr_vals, _, _ = multipletests(p_values[valid_mask], method="fdr_bh")
+        fdr[valid_mask] = fdr_vals
+
+    result = pd.DataFrame({
+        "gene":         expr.index,
+        "log2fc":       log2fc,
+        "pvalue":       p_values,
+        "fdr":          fdr,
+        "mean_case":    mean_case,
+        "mean_control": mean_control,
+    }).sort_values("fdr")
+
+    sig = result[result["fdr"] < 0.05]
+    logger.info(f"DEG results: {len(result)} genes, {len(sig)} significant (FDR<0.05)")
+    return result
+
+
+# ── Main pipeline ──────────────────────────────────────────────────────────────
+
+def process_dataset(cfg: dict) -> bool:
+    geo_id       = cfg["geo_id"]
+    disease_id   = cfg["disease_id"]
+    disease_name = cfg["disease_name"]
+
+    out_path = OUTPUT_DIR / f"{disease_id.replace(':', '_')}_{geo_id}.json"
+    if out_path.exists():
+        logger.info(f"Signature already exists for {geo_id} — skipping")
+        return True
+
+    logger.info(f"Processing {geo_id} → {disease_name} ({disease_id})")
 
     try:
-        gse = GEOparse.get_GEO(geo=geo_id, destdir=destdir, silent=True)
+        gse = GEOparse.get_GEO(geo=geo_id, destdir=str(CACHE_DIR), silent=True)
     except Exception as e:
         logger.error(f"Failed to download {geo_id}: {e}")
-        return None
+        return False
 
-    # ── 1. Platform Ingestion & Technology Type Routing ───────────────────────
-    try:
-        gpl_id = list(gse.gpls.keys())[0]
-        platform_type = gse.gpls[gpl_id].metadata.get("technology", [""])[0]
-        
-        if "sequencing" in platform_type.lower() or "rna-seq" in platform_type.lower():
-            logger.warning(f"⚠️ {geo_id} is RNA-Seq — supplementary counts matrix download required. Handling separately.")
-            return None
-            
-        # Microarray Path: Pull pre-compiled expression grid using optimized pivot call
-        full_matrix = gse.pivot_samples("VALUE")
-        
-    except Exception as e:
-        logger.error(f"Failed parsing platform layout for {geo_id}: {e}")
-        return None
+    platform_type = ""
+    for gpl in gse.gpls.values():
+        platform_type = " ".join(gpl.metadata.get("technology", [])).lower()
+        break
+    if "sequencing" in platform_type or "rna-seq" in platform_type:
+        logger.warning(f"{geo_id} is RNA-Seq — not yet supported. Skipping.")
+        return False
 
-    # ── 2. Vectorized Condition Sorting via Meta Matching ────────────────────
-    disease_cols = [c for c in full_matrix.columns if disease_keyword.lower() in _get_sample_meta(gse, c)]
-    control_cols = [c for c in full_matrix.columns if control_keyword.lower() in _get_sample_meta(gse, c)]
+    probe_to_gene = {}
+    for gpl in gse.gpls.values():
+        probe_to_gene.update(map_probes_to_genes(gpl))
 
-    logger.info(f"{geo_id}: {len(disease_cols)} disease, {len(control_cols)} control samples verified via matrix pivot.")
+    if not probe_to_gene:
+        logger.error(f"No probe-to-gene mapping for {geo_id}")
+        return False
 
-    if len(disease_cols) < min_samples or len(control_cols) < min_samples:
-        logger.warning(
-            f"Insufficient cohorts matched inside {geo_id} for keywords: "
-            f"disease='{disease_keyword}', control='{control_keyword}'."
-        )
-        return None
+    cases, controls = stratify_samples(gse, cfg["case_keywords"], cfg["control_keywords"])
+    logger.info(f"{geo_id}: {len(cases)} cases, {len(controls)} controls")
 
-    # Slice expression profiles out of our comprehensive data frame
-    disease_expr = full_matrix[disease_cols].apply(pd.to_numeric, errors="coerce").dropna(how="all")
-    control_expr = full_matrix[control_cols].apply(pd.to_numeric, errors="coerce").dropna(how="all")
+    if not cases or not controls:
+        logger.error(f"Could not stratify samples for {geo_id}. Check keywords in config.")
+        return False
 
-    if disease_expr.empty or control_expr.empty:
-        logger.error(f"Resulting data slices were completely empty for matrix calculation on {geo_id}")
-        return None
+    deg_df = compute_deg_signature(gse, cases, controls, probe_to_gene)
+    if deg_df is None:
+        return False
 
-    # ── 3. Map probe IDs to gene symbols ──────────────────────────────────────
-    if hasattr(gse, "gpls") and gse.gpls:
-        probe_map = _build_probe_to_gene_map(gse.gpls[gpl_id].table)
-        disease_expr.index = disease_expr.index.map(lambda x: probe_map.get(str(x), str(x)))
-        control_expr.index = control_expr.index.map(lambda x: probe_map.get(str(x), str(x)))
-
-    # ── 4. Compute differential expression ────────────────────────────────────
-    common_genes = disease_expr.index.intersection(control_expr.index)
-    if len(common_genes) == 0:
-        logger.error(f"No common genes between disease and control for {geo_id}")
-        return None
-
-    disease_vals = disease_expr.loc[common_genes]
-    control_vals = control_expr.loc[common_genes]
-
-    signature = {}
-    for gene in common_genes:
-        d_row = disease_vals.loc[gene].dropna().values
-        c_row = control_vals.loc[gene].dropna().values
-
-        # If duplicate mappings exist for a gene, treat arrays uniformly
-        if d_row.ndim > 1: d_row = d_row.flatten()
-        if c_row.ndim > 1: c_row = c_row.flatten()
-
-        if len(d_row) < 2 or len(c_row) < 2:
-            continue
-
-        try:
-            d_mean = np.mean(d_row)
-            c_mean = np.mean(c_row)
-            log2fc = (
-                np.log2(d_mean + 1) - np.log2(c_mean + 1)
-                if d_mean > 50 else d_mean - c_mean
-            )
-            _, pval = stats.ttest_ind(d_row, c_row)
-            if pval < 0.1:
-                signature[str(gene)] = float(log2fc)
-        except Exception:
-            continue
-
-    logger.info(f"{geo_id}: computed signature for {len(signature)} genes")
-
-    if len(signature) > top_n_genes:
-        sorted_by_abs = sorted(
-            signature.items(), key=lambda x: abs(x[1]), reverse=True
-        )
-        signature = dict(sorted_by_abs[:top_n_genes])
-
-    return signature
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    sig = deg_df[deg_df["fdr"] < 0.05].head(500)
+    output = {
+        "disease_id":   disease_id,
+        "disease_name": disease_name,
+        "geo_id":       geo_id,
+        "n_cases":      len(cases),
+        "n_controls":   len(controls),
+        "n_sig_genes":  len(sig),
+        "top_genes":    sig[["gene", "log2fc", "fdr"]].to_dict(orient="records"),
+        "full_results": deg_df[["gene", "log2fc", "pvalue", "fdr"]].to_dict(orient="records"),
+    }
+    with open(out_path, "w") as f:
+        json.dump(output, f, indent=2)
+    logger.info(f"Saved → {out_path}")
+    return True
 
 
-def _build_probe_to_gene_map(platform_table) -> dict[str, str]:
-    probe_map = {}
-    if platform_table is None or platform_table.empty:
-        return probe_map
+def main():
+    parser = argparse.ArgumentParser(description="Compute GEO DEG signatures")
+    subparsers = parser.add_subparsers(dest="command")
 
-    gene_col = None
-    for col in platform_table.columns:
-        col_lower = col.lower()
-        if "gene_symbol" in col_lower or "gene symbol" in col_lower:
-            gene_col = col
-            break
-        if "symbol" in col_lower:
-            gene_col = col
-            break
+    # discover subcommand
+    disc = subparsers.add_parser("discover", help="Search GEO and add new disease datasets")
+    disc.add_argument("disease_name", help="Disease name to search (e.g. 'Gaucher disease')")
+    disc.add_argument("disease_id",   help="Orphanet ID (e.g. ORPHA:77)")
+    disc.add_argument("--yes", action="store_true", help="Auto-confirm all prompts")
 
-    id_col = platform_table.columns[0]
+    # list subcommand
+    subparsers.add_parser("list", help="List configured datasets")
 
-    if gene_col and id_col:
-        for _, row in platform_table.iterrows():
-            probe = str(row[id_col])
-            gene  = str(row[gene_col]).strip()
-            if gene and gene != "nan" and gene != "---":
-                genes = [g.strip() for g in gene.split("///")]
-                probe_map[probe] = genes[0] if genes else gene
+    # default: process (positional geo_id optional)
+    parser.add_argument("geo_id", nargs="?", help="Single GSE ID to process")
 
-    return probe_map
+    args = parser.parse_args()
 
+    if args.command == "discover":
+        cmd_discover(args.disease_name, args.disease_id, auto_confirm=args.yes)
+        return
 
-def run_all():
-    results = {}
+    if args.command == "list" or (not args.command and args.geo_id is None and "--list" in sys.argv):
+        cfg = load_config()
+        datasets = cfg.get("datasets", [])
+        logger.info(f"Loaded {len(datasets)} dataset configs from {CONFIG_PATH}")
+        print(f"\nConfigured datasets ({CONFIG_PATH}):\n")
+        for d in datasets:
+            print(f"  {d['geo_id']}  {d['disease_id']}  {d['disease_name']}")
+        print()
+        return
 
-    for config in DISEASE_GEO_CONFIG:
-        disease_id = config["disease_id"]
-        geo_id     = config["geo_id"]
-        logger.info(
-            f"\n{'='*60}\n"
-            f"Processing: {config['disease_name']} ({disease_id})\n"
-            f"GEO series: {geo_id}\n"
-            f"{'='*60}"
-        )
+    cfg      = load_config()
+    datasets = cfg.get("datasets", [])
 
-        sig = compute_signature_from_geo(
-            geo_id=geo_id,
-            disease_keyword=config["disease_keyword"],
-            control_keyword=config["control_keyword"],
-        )
+    if args.geo_id:
+        matches = [d for d in datasets if d["geo_id"] == args.geo_id]
+        if not matches:
+            logger.error(f"{args.geo_id} not in config. Add it via 'discover' or manually.")
+            sys.exit(1)
+        datasets = matches
 
-        if sig:
-            geo_path = os.path.join(
-                OUTPUT_DIR,
-                f"{disease_id.replace(':', '_')}_{geo_id}.json"
-            )
-            with open(geo_path, "w") as f:
-                json.dump(sig, f, indent=2)
-            logger.info(f"Saved: {geo_path}")
-
-            if disease_id not in results:
-                results[disease_id] = {}
-            for gene, log2fc in sig.items():
-                if gene in results[disease_id]:
-                    results[disease_id][gene].append(log2fc)
-                else:
-                    results[disease_id][gene] = [log2fc]
-
-    # Save merged signatures
-    for disease_id, gene_values in results.items():
-        merged      = {gene: float(np.mean(vals)) for gene, vals in gene_values.items()}
-        merged_path = os.path.join(
-            OUTPUT_DIR,
-            f"{disease_id.replace(':', '_')}.json"
-        )
-        with open(merged_path, "w") as f:
-            json.dump(merged, f, indent=2)
-        logger.info(
-            f"Saved merged signature for {disease_id}: "
-            f"{len(merged)} genes → {merged_path}"
-        )
-
-    logger.info(f"\nDone. {len(results)} disease signatures computed.")
+    results = {d["geo_id"]: process_dataset(d) for d in datasets}
+    passed  = sum(results.values())
+    logger.info(f"Done: {passed}/{len(results)} datasets processed successfully")
+    if passed < len(results):
+        logger.warning(f"Failed: {[k for k, v in results.items() if not v]}")
 
 
 if __name__ == "__main__":
-    run_all()
+    # Support legacy --list flag
+    if "--list" in sys.argv:
+        sys.argv = [sys.argv[0], "list"]
+    main()

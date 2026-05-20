@@ -3,22 +3,23 @@ src/ingestion/pharmgkb_client.py
 
 PharmGKB client for CYP substrate/inhibitor/inducer data.
 
-Fix #6: Added _ensure_data_downloaded() called on __init__ so the
-relationships file is fetched automatically on first use. Previously
-the engine silently fell through to the hardcoded CYP_REFERENCE table
-and never downloaded the full dataset.
+Fix #11: Rewrote parser to use drugLabels.byGene.tsv (the file PharmGKB
+actually ships with useful data) instead of relationships.tsv whose PK
+column is now always empty in the current PharmGKB export.
 
-The hardcoded CYP_REFERENCE table is kept as the last-resort fallback
-(covers the ~30 most common drugs in rare-disease trials) so the engine
-still works offline or if the download fails, but the full PharmGKB file
-is now the primary source when available.
+Strategy:
+  1. Download drugLabels.zip (contains drugLabels.byGene.tsv)
+  2. Parse gene→drug mappings from label name strings
+  3. For each (drug, CYP) pair, call DailyMed Clinical Pharmacology section
+     to classify as substrate / inhibitor / inducer from label text
+  4. Fall back to CYP_REFERENCE for drugs not in DailyMed
+
+The hardcoded CYP_REFERENCE table is kept as last-resort fallback
+(covers ~30 most common drugs in rare-disease trials).
 
 Setup:
-  The client auto-downloads on first use. If the network is not available,
-  download manually:
-    https://www.pharmgkb.org/downloads → relationships.zip
-    Extract to: data/raw/pharmgkb/relationships.tsv
-  Then run:
+  Auto-downloads on first use. To force a re-parse:
+    rm data/processed/pharmgkb_cyp_profiles.json
     python -m src.ingestion.pharmgkb_client parse
 """
 
@@ -29,6 +30,8 @@ import io
 import json
 import logging
 import os
+import re
+import time
 import zipfile
 from typing import Optional
 
@@ -38,11 +41,24 @@ from src.ingestion.cache import cached_api_call
 
 logger = logging.getLogger(__name__)
 
-PHARMGKB_BASE = "https://api.pharmgkb.org/v1"
-PHARMGKB_RELATIONSHIPS_URL = "https://api.pharmgkb.org/v1/download/file/data/relationships.zip"
+PHARMGKB_DRUG_LABELS_URL = "https://api.pharmgkb.org/v1/download/file/data/drugLabels.zip"
 
-PROCESSED_PGX_PATH = "data/processed/pharmgkb_cyp_profiles.json"
-RAW_RELATIONSHIPS  = "data/raw/pharmgkb/relationships.tsv"
+PROCESSED_PGX_PATH   = "data/processed/pharmgkb_cyp_profiles.json"
+RAW_PHARMGKB_DIR     = "data/raw/pharmgkb"
+RAW_BY_GENE_PATH     = "data/raw/pharmgkb/drugLabels.byGene.tsv"
+
+DAILYMED_SEARCH = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
+DAILYMED_SPL    = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/{setid}/sections.json"
+
+_SUBSTRATE_RE = re.compile(r'\bsubstrate\b', re.I)
+_INHIBITOR_RE = re.compile(r'\binhibit', re.I)
+_INDUCER_RE   = re.compile(r'\binduc', re.I)
+
+# Label name pattern: "Annotation of FDA Label for sildenafil and CYP3A4, CYP2C9"
+_LABEL_NAME_RE = re.compile(
+    r'Annotation of (?:FDA|EMA|HCSC|PMDA|Swissmedic) Label for (.+?) and (CYP[\w,\s]+)',
+    re.I,
+)
 
 # ── Hardcoded CYP reference — fallback only ────────────────────────────────────
 CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
@@ -51,22 +67,22 @@ CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
         "inhibitors": [],
         "inducers":   ["CYP3A4", "CYP1A2", "CYP2C9", "CYP2C19", "CYP2B6"],
     },
-    "valproate":     {
+    "valproate": {
         "substrates": ["CYP2C9", "CYP2A6"],
         "inhibitors": ["CYP2C9", "CYP2C19"],
         "inducers":   [],
     },
-    "phenytoin":     {
+    "phenytoin": {
         "substrates": ["CYP2C9", "CYP2C19"],
         "inhibitors": ["CYP2C19"],
         "inducers":   ["CYP3A4", "CYP2C9"],
     },
-    "clobazam":      {
+    "clobazam": {
         "substrates": ["CYP3A4", "CYP2C19"],
         "inhibitors": ["CYP2D6"],
         "inducers":   [],
     },
-    "topiramate":    {
+    "topiramate": {
         "substrates": ["CYP3A4"],
         "inhibitors": ["CYP2C19"],
         "inducers":   ["CYP3A4"],
@@ -76,97 +92,97 @@ CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
         "inhibitors": [],
         "inducers":   [],
     },
-    "stiripentol":   {
+    "stiripentol": {
         "substrates": ["CYP1A2", "CYP2C19", "CYP3A4"],
         "inhibitors": ["CYP2C19", "CYP3A4", "CYP1A2"],
         "inducers":   [],
     },
-    "sildenafil":    {
+    "sildenafil": {
         "substrates": ["CYP3A4", "CYP2C9"],
         "inhibitors": [],
         "inducers":   [],
     },
-    "tadalafil":     {
+    "tadalafil": {
         "substrates": ["CYP3A4"],
         "inhibitors": [],
         "inducers":   [],
     },
-    "bosentan":      {
+    "bosentan": {
         "substrates": ["CYP3A4", "CYP2C9"],
         "inhibitors": [],
         "inducers":   ["CYP3A4", "CYP2C9"],
     },
-    "ambrisentan":   {
+    "ambrisentan": {
         "substrates": ["CYP3A4", "CYP2C19", "UGT1A9S"],
         "inhibitors": [],
         "inducers":   [],
     },
-    "warfarin":      {
+    "warfarin": {
         "substrates": ["CYP2C9", "CYP1A2", "CYP3A4"],
         "inhibitors": [],
         "inducers":   [],
     },
-    "imatinib":      {
+    "imatinib": {
         "substrates": ["CYP3A4", "CYP2C8"],
         "inhibitors": ["CYP3A4", "CYP2D6", "CYP2C9"],
         "inducers":   [],
     },
-    "miglustat":     {
+    "miglustat": {
         "substrates": [],
         "inhibitors": [],
         "inducers":   [],
     },
-    "eliglustat":    {
+    "eliglustat": {
         "substrates": ["CYP2D6", "CYP3A4"],
         "inhibitors": [],
         "inducers":   [],
     },
-    "tacrolimus":    {
+    "tacrolimus": {
         "substrates": ["CYP3A4", "CYP3A5"],
         "inhibitors": [],
         "inducers":   [],
     },
-    "cyclosporine":  {
+    "cyclosporine": {
         "substrates": ["CYP3A4"],
         "inhibitors": ["CYP3A4", "OATP1B1", "OATP1B3"],
         "inducers":   [],
     },
-    "omeprazole":    {
+    "omeprazole": {
         "substrates": ["CYP2C19", "CYP3A4"],
         "inhibitors": ["CYP2C19"],
         "inducers":   [],
     },
-    "esomeprazole":  {
+    "esomeprazole": {
         "substrates": ["CYP2C19", "CYP3A4"],
         "inhibitors": ["CYP2C19"],
         "inducers":   [],
     },
-    "fluoxetine":    {
+    "fluoxetine": {
         "substrates": ["CYP2D6", "CYP2C9"],
         "inhibitors": ["CYP2D6", "CYP2C19"],
         "inducers":   [],
     },
-    "sertraline":    {
+    "sertraline": {
         "substrates": ["CYP2C19", "CYP2D6", "CYP3A4"],
         "inhibitors": ["CYP2D6"],
         "inducers":   [],
     },
-    "fluconazole":   {
+    "fluconazole": {
         "substrates": ["CYP2C9", "CYP3A4"],
         "inhibitors": ["CYP2C9", "CYP3A4", "CYP2C19"],
         "inducers":   [],
     },
-    "rifampicin":    {
+    "rifampicin": {
         "substrates": [],
         "inhibitors": [],
         "inducers":   ["CYP3A4", "CYP2C9", "CYP2C19", "CYP1A2", "CYP2B6"],
     },
-    "fenfluramine":  {
+    "fenfluramine": {
         "substrates": ["CYP1A2", "CYP2B6"],
         "inhibitors": [],
         "inducers":   [],
     },
-    "metformin":     {
+    "metformin": {
         "substrates": [],
         "inhibitors": [],
         "inducers":   [],
@@ -174,74 +190,122 @@ CYP_REFERENCE: dict[str, dict[str, list[str]]] = {
 }
 
 
+# ── Module-level DailyMed helpers ─────────────────────────────────────────────
+
+def _fetch_dailymed_cyp_section(drug_name: str) -> str:
+    """
+    Fetch the Clinical Pharmacology section from DailyMed for a drug.
+    Returns concatenated section text, or empty string on failure.
+    """
+    try:
+        r = requests.get(
+            DAILYMED_SEARCH,
+            params={"drug_name": drug_name, "pagesize": 1},
+            timeout=15,
+            headers={"User-Agent": "PoppyRepurposingEngine/1.0 (research)"},
+        )
+        if r.status_code != 200:
+            return ""
+        spls = r.json().get("data", [])
+        if not spls:
+            return ""
+        setid = spls[0].get("setid", "")
+        if not setid:
+            return ""
+
+        r2 = requests.get(
+            DAILYMED_SPL.format(setid=setid),
+            params={"tocsection": "clinical-pharmacology"},
+            timeout=15,
+            headers={"User-Agent": "PoppyRepurposingEngine/1.0 (research)"},
+        )
+        if r2.status_code != 200:
+            return ""
+
+        sections = r2.json().get("data", {}).get("sections", [])
+        parts = []
+        for sec in sections:
+            content = sec.get("sectionText", "") or sec.get("text", "")
+            if content:
+                parts.append(re.sub(r'<[^>]+>', ' ', content))
+        return " ".join(parts)
+
+    except Exception as e:
+        logger.debug(f"DailyMed fetch failed for {drug_name}: {e}")
+        return ""
+
+
+def _extract_gene_context(text: str, gene: str) -> str:
+    """
+    Extract sentences from label text that mention the given CYP gene.
+    Returns up to 3 surrounding sentences concatenated.
+    """
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    relevant = [s for s in sentences if gene in s]
+    return " ".join(relevant[:3])
+
+
+# ── PharmGKBClient ────────────────────────────────────────────────────────────
+
 class PharmGKBClient:
     """
     PharmGKB client for CYP substrate/inhibitor/inducer data.
 
     Priority order for data lookup:
-        1. Parsed PharmGKB relationships file (data/processed/pharmgkb_cyp_profiles.json)
+        1. Parsed PharmGKB drugLabels file (data/processed/pharmgkb_cyp_profiles.json)
         2. Hardcoded CYP_REFERENCE table (covers most common drugs)
-        3. PharmGKB REST API drug label endpoint
-
-    Fix #6: _ensure_data_downloaded() is called on __init__ so the full
-    PharmGKB dataset is fetched automatically on first use.
+        3. PharmGKB REST API drug label endpoint (last resort, rarely useful)
     """
 
     def __init__(self):
         self._parsed_db: Optional[dict] = None
         self._ensure_data_downloaded()
 
-    # ── Fix #6: auto-download ──────────────────────────────────────────────────
+    # ── Auto-download ──────────────────────────────────────────────────────────
 
     def _ensure_data_downloaded(self):
         """
-        Auto-download PharmGKB relationships file if not present.
-
-        Fix #6: Previously the engine silently fell through to the small
-        hardcoded reference table on every run because no download was
-        ever triggered. This method is called once at __init__ and ensures
-        the full dataset is present before any scoring starts.
+        Auto-download PharmGKB drugLabels.zip if not present and parse it.
+        Called once at __init__.
         """
         # Already processed — nothing to do
         if os.path.exists(PROCESSED_PGX_PATH):
             return
 
         # Raw file already present — just parse it
-        if os.path.exists(RAW_RELATIONSHIPS):
-            logger.info("PharmGKB raw relationships file found — parsing...")
-            self._parsed_db = self.parse_relationships_file()
+        if os.path.exists(RAW_BY_GENE_PATH):
+            logger.info("PharmGKB drugLabels.byGene.tsv found — parsing...")
+            self._parsed_db = self.parse_drug_labels()
             return
 
-        # Neither exists — download now
-        logger.info(
-            "PharmGKB relationships file not found — downloading from PharmGKB..."
-        )
+        # Neither exists — download drugLabels.zip
+        logger.info("PharmGKB drugLabels not found — downloading...")
         try:
             r = requests.get(
-                PHARMGKB_RELATIONSHIPS_URL,
+                PHARMGKB_DRUG_LABELS_URL,
                 timeout=120,
                 stream=True,
                 headers={"User-Agent": "PoppyRepurposingEngine/1.0 (research)"},
             )
             r.raise_for_status()
-
             content = b"".join(r.iter_content(chunk_size=65536))
             z = zipfile.ZipFile(io.BytesIO(content))
-            os.makedirs("data/raw/pharmgkb", exist_ok=True)
-            z.extractall("data/raw/pharmgkb")
-            logger.info("PharmGKB downloaded successfully. Parsing...")
-            self._parsed_db = self.parse_relationships_file()
+            os.makedirs(RAW_PHARMGKB_DIR, exist_ok=True)
+            z.extractall(RAW_PHARMGKB_DIR)
+            logger.info("PharmGKB drugLabels downloaded. Parsing...")
+            self._parsed_db = self.parse_drug_labels()
         except Exception as e:
             logger.error(
                 f"PharmGKB auto-download failed: {e}. "
-                f"Download manually from https://www.pharmgkb.org/downloads "
-                f"and extract to data/raw/pharmgkb/relationships.tsv"
+                f"Download manually: curl -L '{PHARMGKB_DRUG_LABELS_URL}' "
+                f"-o data/raw/pharmgkb/drugLabels.zip && "
+                f"cd data/raw/pharmgkb && unzip drugLabels.zip"
             )
 
     # ── Data access ────────────────────────────────────────────────────────────
 
     def _load_parsed_db(self) -> dict:
-        """Load parsed PharmGKB relationships if file exists."""
+        """Load parsed PharmGKB CYP profiles if file exists."""
         if self._parsed_db is not None:
             return self._parsed_db
         if os.path.exists(PROCESSED_PGX_PATH):
@@ -277,123 +341,150 @@ class PharmGKBClient:
         if key in db:
             return db[key]
 
-        # 2. Hardcoded reference table (fallback for common drugs)
+        # 2. Hardcoded reference table
         if key in CYP_REFERENCE:
             return CYP_REFERENCE[key]
 
-        # Also try without salt/form suffixes (e.g. "valproate sodium" → "valproate")
+        # Try without salt/form suffixes (e.g. "valproate sodium" → "valproate")
         for ref_key in CYP_REFERENCE:
             if key.startswith(ref_key) or ref_key.startswith(key.split()[0]):
                 return CYP_REFERENCE[ref_key]
 
-        # 3. PharmGKB REST API fallback
+        # 3. PharmGKB REST API (last resort)
         api_result = self._query_pharmgkb_api(drug_name)
         if api_result:
             return api_result
 
-        logger.warning(
-            f"No CYP profile found for '{drug_name}'. "
-            f"Download PharmGKB relationships.tsv for full coverage: "
-            f"https://www.pharmgkb.org/downloads"
-        )
+        logger.warning(f"No CYP profile found for '{drug_name}'.")
         return {"substrates": [], "inhibitors": [], "inducers": []}
 
     @cached_api_call(ttl_seconds=86400 * 90)
     def _query_pharmgkb_api(self, drug_name: str) -> Optional[dict]:
-        """Query PharmGKB drug label API for CYP relationships (last resort)."""
+        """Query PharmGKB REST API (last resort — structured CYP data not reliably available)."""
         try:
             r = requests.get(
-                f"{PHARMGKB_BASE}/data/drug",
+                "https://api.pharmgkb.org/v1/data/drug",
                 params={"name": drug_name, "view": "base"},
                 headers={"Accept": "application/json"},
                 timeout=15,
             )
             if r.status_code != 200:
                 return None
-            data = r.json()
-            drugs = data.get("data", [])
-            if not drugs:
-                return None
-            # The REST API doesn't expose structured CYP data reliably;
-            # return None here and let the caller fall through to the reference table.
+            # PharmGKB REST API doesn't expose structured CYP data; always falls through
             return None
         except Exception as e:
             logger.debug(f"PharmGKB API query failed for {drug_name}: {e}")
             return None
 
-    # ── File parsing ──────────────────────────────────────────────────────────
+    # ── Parser ────────────────────────────────────────────────────────────────
 
     @classmethod
-    def parse_relationships_file(
+    def parse_drug_labels(
         cls,
-        input_path: str = RAW_RELATIONSHIPS,
-        output_path: str = PROCESSED_PGX_PATH,
+        bylabel_path: str = RAW_BY_GENE_PATH,
+        output_path:  str = PROCESSED_PGX_PATH,
     ) -> dict:
         """
-        Parse downloaded PharmGKB relationships.tsv and extract CYP profiles.
+        Parse drugLabels.byGene.tsv to build drug→CYP profiles.
 
-        PharmGKB relationships TSV columns:
-            Entity1_id, Entity1_name, Entity1_type,
-            Entity2_id, Entity2_name, Entity2_type,
-            Evidence, Association, PK, PD
+        drugLabels.byGene.tsv schema:
+            Gene ID | Gene Symbol | Label IDs | Label Names
+
+        Label Names is a semicolon-separated list like:
+            "Annotation of FDA Label for sildenafil and CYP3A4, CYP2C9"
+
+        For each (drug, CYP gene) pair, calls DailyMed Clinical Pharmacology
+        section to classify the relationship as substrate/inhibitor/inducer.
+        Falls back to CYP_REFERENCE for drugs not found in DailyMed.
         """
-        if not os.path.exists(input_path):
+        if not os.path.exists(bylabel_path):
             logger.error(
-                f"PharmGKB relationships file not found at {input_path}. "
-                f"Download from: https://www.pharmgkb.org/downloads → relationships.zip"
+                f"drugLabels.byGene.tsv not found at {bylabel_path}. "
+                f"Run: curl -L '{PHARMGKB_DRUG_LABELS_URL}' -o data/raw/pharmgkb/drugLabels.zip "
+                f"&& cd data/raw/pharmgkb && unzip drugLabels.zip"
             )
             return {}
 
-        cyp_profiles: dict[str, dict[str, list]] = {}
+        # Step 1: build drug → set of CYP genes from label name strings
+        drug_cyp_map: dict[str, set] = {}
 
-        with open(input_path, newline="", encoding="utf-8") as f:
+        with open(bylabel_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter="\t")
             for row in reader:
-                e1_type = row.get("Entity1_type", "")
-                e2_type = row.get("Entity2_type", "")
-                e1_name = row.get("Entity1_name", "").lower()
-                e2_name = row.get("Entity2_name", "").lower()
-                pk_field = row.get("PK", "")
-
-                if not pk_field:
+                gene_symbol = row.get("Gene Symbol", "").strip().upper()
+                if not gene_symbol.startswith("CYP"):
                     continue
-
-                drug_name = None
-                gene_name = None
-
-                if e1_type == "Chemical" and e2_type == "Gene":
-                    drug_name = e1_name
-                    gene_name = e2_name.upper()
-                elif e2_type == "Chemical" and e1_type == "Gene":
-                    drug_name = e2_name
-                    gene_name = e1_name.upper()
-                else:
-                    continue
-
-                if not gene_name.startswith("CYP"):
-                    continue
-
-                if drug_name not in cyp_profiles:
-                    cyp_profiles[drug_name] = {
-                        "substrates": [], "inhibitors": [], "inducers": []
+                label_names = row.get("Label Names", "")
+                for match in _LABEL_NAME_RE.finditer(label_names):
+                    drug_raw = match.group(1).strip().lower()
+                    # Parse all CYP genes from the match
+                    cyp_genes = {
+                        g.strip().upper()
+                        for g in re.split(r'[,;]', match.group(2))
+                        if g.strip().upper().startswith("CYP")
                     }
+                    cyp_genes.add(gene_symbol)  # belt-and-suspenders
+                    if drug_raw not in drug_cyp_map:
+                        drug_cyp_map[drug_raw] = set()
+                    drug_cyp_map[drug_raw].update(cyp_genes)
 
-                pk_lower = pk_field.lower()
-                if "substrate" in pk_lower and gene_name not in cyp_profiles[drug_name]["substrates"]:
-                    cyp_profiles[drug_name]["substrates"].append(gene_name)
-                elif "inhibit" in pk_lower and gene_name not in cyp_profiles[drug_name]["inhibitors"]:
-                    cyp_profiles[drug_name]["inhibitors"].append(gene_name)
-                elif "induc" in pk_lower and gene_name not in cyp_profiles[drug_name]["inducers"]:
-                    cyp_profiles[drug_name]["inducers"].append(gene_name)
+        logger.info(f"drugLabels.byGene: {len(drug_cyp_map)} drug-CYP pairs found")
+
+        # Step 2: classify each (drug, CYP) pair via DailyMed
+        cyp_profiles: dict[str, dict] = {}
+
+        for drug_name, cyp_genes in drug_cyp_map.items():
+            profile: dict[str, list] = {"substrates": [], "inhibitors": [], "inducers": []}
+
+            label_text = _fetch_dailymed_cyp_section(drug_name)
+
+            for gene in sorted(cyp_genes):
+                if not label_text:
+                    # No DailyMed text — fall back to hardcoded reference
+                    ref = CYP_REFERENCE.get(drug_name, {})
+                    if gene in ref.get("substrates", []):
+                        profile["substrates"].append(gene)
+                    if gene in ref.get("inhibitors", []):
+                        profile["inhibitors"].append(gene)
+                    if gene in ref.get("inducers", []):
+                        profile["inducers"].append(gene)
+                    continue
+
+                context = _extract_gene_context(label_text, gene)
+                if not context:
+                    continue
+
+                if _SUBSTRATE_RE.search(context) and gene not in profile["substrates"]:
+                    profile["substrates"].append(gene)
+                if _INHIBITOR_RE.search(context) and gene not in profile["inhibitors"]:
+                    profile["inhibitors"].append(gene)
+                if _INDUCER_RE.search(context) and gene not in profile["inducers"]:
+                    profile["inducers"].append(gene)
+
+            if any(profile.values()):
+                cyp_profiles[drug_name] = profile
+
+            time.sleep(0.15)  # polite DailyMed delay
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "w") as f:
             json.dump(cyp_profiles, f, indent=2)
 
         logger.info(
-            f"PharmGKB parsed: {len(cyp_profiles)} drugs with CYP data → {output_path}"
+            f"PharmGKB parsed: {len(cyp_profiles)} drugs with CYP profiles → {output_path}"
         )
         return cyp_profiles
+
+    # ── Legacy alias — kept so any external callers don't break ───────────────
+    @classmethod
+    def parse_relationships_file(cls, *args, **kwargs) -> dict:
+        """Deprecated. Calls parse_drug_labels() instead."""
+        logger.warning(
+            "parse_relationships_file() is deprecated; "
+            "relationships.tsv PK column is empty in current PharmGKB exports. "
+            "Calling parse_drug_labels() instead."
+        )
+        return cls.parse_drug_labels()
 
 
 if __name__ == "__main__":
@@ -402,18 +493,22 @@ if __name__ == "__main__":
     command = sys.argv[1] if len(sys.argv) > 1 else "help"
 
     if command == "parse":
-        result = PharmGKBClient.parse_relationships_file()
+        result = PharmGKBClient.parse_drug_labels()
         print(f"Parsed {len(result)} drug profiles")
 
     elif command == "test":
         client = PharmGKBClient()
-        for drug in ["sildenafil", "carbamazepine", "imatinib", "valproate"]:
+        for drug in ["sildenafil", "carbamazepine", "imatinib", "valproate", "eliglustat"]:
             profile = client.get_full_cyp_profile(drug)
-            print(f"{drug}: substrates={profile['substrates']}, inhibitors={profile['inhibitors']}")
+            print(
+                f"{drug}: substrates={profile['substrates']}, "
+                f"inhibitors={profile['inhibitors']}, "
+                f"inducers={profile['inducers']}"
+            )
 
     else:
         print("Usage: python -m src.ingestion.pharmgkb_client [parse|test]")
         print()
-        print("Auto-download runs on first import. To force a re-download:")
-        print("  rm data/raw/pharmgkb/relationships.tsv data/processed/pharmgkb_cyp_profiles.json")
+        print("To force a re-parse:")
+        print("  rm data/processed/pharmgkb_cyp_profiles.json")
         print("  python -m src.ingestion.pharmgkb_client parse")
