@@ -3,23 +3,19 @@ src/graph/ppi_network.py
 
 Human Protein-Protein Interactome builder for Layer 1B (network proximity).
 
-Downloads STRING DB v12 human PPI data and builds a NetworkX graph.
-Nodes = UniProt IDs. Edges weighted by STRING combined confidence score.
-
-Setup (run once, ~30 minutes):
-    python -m src.graph.ppi_network build
-
-Requirements:
-    ~2GB download, ~8GB RAM to hold graph in memory.
-    Pickles to ~500MB at data/processed/ppi_network.pkl
-
-STRING DB:
-    https://stringdb-downloads.org/download/protein.links.v12.0/
-    File: 9606.protein.links.v12.0.txt.gz  (human, all interaction types)
-    Also: 9606.protein.info.v12.0.txt.gz   (protein ID → gene name mapping)
+Fixes applied:
+  - After nx.relabel_nodes, any node that was NOT in the UniProt map keeps
+    its original STRING ID (9606.ENSP...). These will never match UniProt IDs
+    from ChEMBL/OpenTargets, making Layer 1B silently return None for every pair.
+    Fixed: unmapped STRING-format nodes are removed after relabeling.
+  - Added a brief post-relabel stats log so the engineer can see how many
+    nodes were mapped vs dropped.
+  - build_ppi_graph now returns None explicitly (with a clear error) when the
+    aliases file is present but produces an empty map (e.g. wrong column names).
 """
 
 from __future__ import annotations
+
 import gzip
 import logging
 import os
@@ -38,20 +34,19 @@ STRING_INFO_URL = (
     "https://stringdb-downloads.org/download/protein.info.v12.0/"
     "9606.protein.info.v12.0.txt.gz"
 )
-STRING_RAW_PATH = "data/raw/string_db/9606.protein.links.v12.0.txt.gz"
+STRING_RAW_PATH  = "data/raw/string_db/9606.protein.links.v12.0.txt.gz"
 STRING_INFO_PATH = "data/raw/string_db/9606.protein.info.v12.0.txt.gz"
 GRAPH_OUTPUT_PATH = "data/processed/ppi_network.pkl"
-UNIPROT_MAP_PATH = "data/processed/string_to_uniprot.json"
+UNIPROT_MAP_PATH  = "data/processed/string_to_uniprot.json"
 
-# STRING confidence cutoff (0–1000). 400 = medium confidence (recommended).
 CONFIDENCE_CUTOFF = 400
+
+# STRING node IDs for human proteins always start with this prefix
+_STRING_PREFIX = "9606."
 
 
 def download_string_db(force: bool = False) -> bool:
-    """
-    Download STRING DB human interactome files.
-    Returns True if successful, False if already exists.
-    """
+    """Download STRING DB human interactome files."""
     import requests
     from tqdm import tqdm
 
@@ -91,12 +86,11 @@ def build_ppi_graph(
     output_path: str = GRAPH_OUTPUT_PATH,
 ) -> Optional[object]:
     """
-    Parse STRING DB links file and build NetworkX graph.
+    Parse STRING DB links file and build a NetworkX graph with UniProt node IDs.
 
-    Nodes = STRING protein IDs (9606.ENSP...) — converted to UniProt where possible.
-    Edges = weighted by combined_score / 1000 (0–1 range).
-
-    Returns the NetworkX graph, or None if failed.
+    FIX: After nx.relabel_nodes, any node that was not in the UniProt mapping
+    retains its original STRING ID (9606.ENSP...). These nodes can never be
+    matched against ChEMBL/OpenTargets UniProt IDs, so they are removed.
     """
     try:
         import networkx as nx
@@ -117,32 +111,63 @@ def build_ppi_graph(
     edge_count = 0
 
     with gzip.open(links_path, "rt") as f:
-        header = f.readline()   # skip header
-
+        f.readline()  # skip header
         for line in f:
             parts = line.strip().split()
             if len(parts) < 3:
                 continue
             p1, p2, score = parts[0], parts[1], int(parts[2])
-
             if score < confidence_cutoff:
                 continue
-
             G.add_edge(p1, p2, weight=score / 1000)
             edge_count += 1
 
     logger.info(
-        f"Graph built: {G.number_of_nodes()} nodes, {edge_count} edges "
+        f"Raw graph: {G.number_of_nodes()} nodes, {edge_count} edges "
         f"(cutoff={confidence_cutoff})"
     )
 
-    # Map STRING IDs to UniProt IDs (better for cross-referencing with ChEMBL/DisGeNET)
+    # Load STRING → UniProt mapping
     uniprot_map = _load_string_to_uniprot_map()
-    if uniprot_map:
-        G = nx.relabel_nodes(G, uniprot_map, copy=True)
-        logger.info(f"Relabeled {len(uniprot_map)} nodes to UniProt IDs")
 
-    # Save to disk
+    if not uniprot_map:
+        logger.error(
+            "Empty STRING→UniProt map. "
+            "Download the aliases file and run build_uniprot_map_from_aliases(). "
+            "Alias file: "
+            "https://stringdb-downloads.org/download/protein.aliases.v12.0/"
+            "9606.protein.aliases.v12.0.txt.gz"
+        )
+        return None
+
+    # Relabel STRING IDs → UniProt IDs
+    G = nx.relabel_nodes(G, uniprot_map, copy=True)
+
+    # FIX: Remove any node that still has the STRING prefix — these were not
+    # in the mapping and will never match UniProt IDs from target/gene lookups.
+    unmapped = [n for n in list(G.nodes) if str(n).startswith(_STRING_PREFIX)]
+    if unmapped:
+        G.remove_nodes_from(unmapped)
+        logger.info(
+            f"Removed {len(unmapped)} unmapped STRING nodes (kept STRING ID). "
+            f"These would never match UniProt lookups from ChEMBL/OpenTargets."
+        )
+
+    mapped_count = G.number_of_nodes()
+    logger.info(
+        f"Final graph: {mapped_count} UniProt nodes, {G.number_of_edges()} edges "
+        f"({len(uniprot_map)} STRING→UniProt mappings applied)"
+    )
+
+    if mapped_count == 0:
+        logger.error(
+            "Graph has 0 nodes after UniProt remapping. "
+            "Check that build_uniprot_map_from_aliases() used the correct "
+            "source columns (Ensembl_HGNC_uniprot_ids or UniProt_AC)."
+        )
+        return None
+
+    # Save
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "wb") as f:
         pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -150,65 +175,61 @@ def build_ppi_graph(
 
     return G
 
+
 def _load_string_to_uniprot_map() -> dict[str, str]:
-    """
-    Load STRING → UniProt ID mapping.
-    Prefer aliases file (has real UniProt ACs) over info file (gene names only).
-    """
+    """Load STRING → UniProt ID mapping, building from aliases if needed."""
     import json
 
     if os.path.exists(UNIPROT_MAP_PATH):
         with open(UNIPROT_MAP_PATH) as f:
             return json.load(f)
 
-    # Use aliases file if available — more reliable than info file
     aliases_path = "data/raw/string_db/9606.protein.aliases.v12.0.txt.gz"
     if os.path.exists(aliases_path):
         return build_uniprot_map_from_aliases(aliases_path)
 
-    # Fall back to info file (gene names — reduced cross-referencing accuracy)
     if os.path.exists(STRING_INFO_PATH):
         return _build_uniprot_map_from_info_file()
 
     logger.warning(
-        f"No STRING→UniProt mapping found. "
-        f"Network proximity will have reduced coverage."
+        "No STRING→UniProt mapping found. "
+        "Download: https://stringdb-downloads.org/download/protein.aliases.v12.0/"
+        "9606.protein.aliases.v12.0.txt.gz"
     )
     return {}
 
+
 def _build_uniprot_map_from_info_file() -> dict[str, str]:
     """
-    Parse STRING protein info file to extract UniProt IDs.
-    Falls back to UniProt API if info file doesn't contain UniProt directly.
+    Parse STRING protein info file as a last resort.
+    Note: info file has gene names, not UniProt ACs — use aliases file when possible.
     """
     import json
 
-    logger.info("Building STRING→UniProt map from info file...")
+    logger.info("Building STRING→UniProt map from info file (gene names only)...")
     mapping = {}
 
     try:
         with gzip.open(STRING_INFO_PATH, "rt") as f:
-            header = f.readline()
+            f.readline()  # skip header
             for line in f:
                 parts = line.strip().split("\t")
                 if len(parts) < 2:
                     continue
-                string_id = parts[0]   # 9606.ENSP00000...
-                # STRING info file has gene names but not directly UniProt
-                # For UniProt mapping, use STRING's UniProt links file or UniProt API
-                # This is a placeholder — see the full mapping script below
+                string_id = parts[0]
                 gene_name = parts[1] if len(parts) > 1 else ""
                 if gene_name:
-                    mapping[string_id] = gene_name   # temporary: use gene name
+                    mapping[string_id] = gene_name
 
         os.makedirs(os.path.dirname(UNIPROT_MAP_PATH), exist_ok=True)
         with open(UNIPROT_MAP_PATH, "w") as f:
             json.dump(mapping, f)
-        logger.info(f"STRING→UniProt map saved ({len(mapping)} entries)")
+        logger.info(f"STRING→gene map saved ({len(mapping)} entries)")
     except Exception as e:
-        logger.error(f"Failed to build UniProt map: {e}")
+        logger.error(f"Failed to build UniProt map from info file: {e}")
 
     return mapping
+
 
 def build_uniprot_map_from_aliases(
     aliases_path: str = "data/raw/string_db/9606.protein.aliases.v12.0.txt.gz",
@@ -217,16 +238,16 @@ def build_uniprot_map_from_aliases(
     """
     Parse STRING aliases file to build STRING ID → UniProt accession mapping.
 
-    Priority order:
-      1. Ensembl_HGNC_uniprot_ids — canonical IDs curated by HGNC (best)
-      2. UniProt_AC               — may include isoforms, use as fallback
+    Priority:
+      1. Ensembl_HGNC_uniprot_ids  — canonical UniProt IDs curated by HGNC
+      2. UniProt_AC                 — may include isoforms, used as fallback
     """
     import json
 
-    logger.info(f"Building STRING→UniProt map from aliases file: {aliases_path}")
+    logger.info(f"Building STRING→UniProt map from: {aliases_path}")
 
-    hgnc = {}      # string_id → canonical UniProt from HGNC
-    fallback = {}  # string_id → UniProt AC (may be isoform)
+    hgnc: dict[str, str] = {}
+    fallback: dict[str, str] = {}
 
     with gzip.open(aliases_path, "rt") as f:
         for line in f:
@@ -242,12 +263,11 @@ def build_uniprot_map_from_aliases(
             if "Ensembl_HGNC_uniprot_ids" in sources:
                 if string_id not in hgnc:
                     hgnc[string_id] = alias
-
             elif "UniProt_AC" in sources:
                 if string_id not in fallback:
                     fallback[string_id] = alias
 
-    # Merge: HGNC canonical wins, UniProt_AC fills the gaps
+    # HGNC canonical wins, UniProt_AC fills the gaps
     mapping = {**fallback, **hgnc}
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -255,8 +275,8 @@ def build_uniprot_map_from_aliases(
         json.dump(mapping, f)
 
     logger.info(
-        f"STRING→UniProt map saved: {len(mapping)} total entries "
-        f"({len(hgnc)} HGNC canonical, {len(fallback)} UniProt_AC fallback) → {output_path}"
+        f"STRING→UniProt map: {len(mapping)} entries "
+        f"({len(hgnc)} HGNC canonical + {len(fallback)} UniProt_AC fallback) → {output_path}"
     )
     return mapping
 
@@ -293,14 +313,6 @@ def graph_stats(G) -> dict:
 
 
 if __name__ == "__main__":
-    """
-    CLI for PPI network management.
-
-    Usage:
-        python -m src.graph.ppi_network download
-        python -m src.graph.ppi_network build
-        python -m src.graph.ppi_network stats
-    """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     command = sys.argv[1] if len(sys.argv) > 1 else "help"
@@ -310,7 +322,7 @@ if __name__ == "__main__":
         sys.exit(0 if success else 1)
 
     elif command == "build":
-        download_string_db()   # no-op if already downloaded
+        download_string_db()
         G = build_ppi_graph()
         if G:
             stats = graph_stats(G)

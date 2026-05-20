@@ -646,7 +646,10 @@ def process_dataset(cfg: dict) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute GEO DEG signatures")
+    parser = argparse.ArgumentParser(
+        description="Compute GEO DEG signatures",
+        usage="%(prog)s [geo_id] | discover <disease_name> <disease_id> | list"
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     # discover subcommand
@@ -658,8 +661,9 @@ def main():
     # list subcommand
     subparsers.add_parser("list", help="List configured datasets")
 
-    # default: process (positional geo_id optional)
-    parser.add_argument("geo_id", nargs="?", help="Single GSE ID to process")
+    # process subcommand (optional geo_id)
+    proc = subparsers.add_parser("process", help="Process all or one configured dataset")
+    proc.add_argument("geo_id", nargs="?", help="Single GSE ID to process (default: all)")
 
     args = parser.parse_args()
 
@@ -667,7 +671,7 @@ def main():
         cmd_discover(args.disease_name, args.disease_id, auto_confirm=args.yes)
         return
 
-    if args.command == "list" or (not args.command and args.geo_id is None and "--list" in sys.argv):
+    if args.command == "list":
         cfg = load_config()
         datasets = cfg.get("datasets", [])
         logger.info(f"Loaded {len(datasets)} dataset configs from {CONFIG_PATH}")
@@ -677,13 +681,15 @@ def main():
         print()
         return
 
+    # Default: process (with or without geo_id)
+    geo_id = getattr(args, "geo_id", None)
     cfg      = load_config()
     datasets = cfg.get("datasets", [])
 
-    if args.geo_id:
-        matches = [d for d in datasets if d["geo_id"] == args.geo_id]
+    if geo_id:
+        matches = [d for d in datasets if d["geo_id"] == geo_id]
         if not matches:
-            logger.error(f"{args.geo_id} not in config. Add it via 'discover' or manually.")
+            logger.error(f"{geo_id} not in config. Add it via 'discover' or manually.")
             sys.exit(1)
         datasets = matches
 

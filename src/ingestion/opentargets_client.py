@@ -16,6 +16,7 @@ Previous fixes:
 """
 
 from __future__ import annotations
+import os
 
 import logging
 import time
@@ -65,11 +66,10 @@ query DiseaseTargets($efoId: String!, $size: Int!) {
 
 _DISEASE_NAME_SEARCH_QUERY = """
 query DiseaseSearch($query: String!) {
-  diseases(q: $query, page: {index: 0, size: 10}) {
-    rows {
+  search(queryString: $query, entityNames: ["disease"], page: {index: 0, size: 10}) {
+    hits {
       id
       name
-      dbXRefs
     }
   }
 }
@@ -108,70 +108,144 @@ class OpenTargetsClient:
     def _dynamic_efo_lookup(self, disease_id: str) -> Optional[str]:
         """
         Resolve a disease ID dynamically:
-          1. Fetch disease name from Orphanet API
-          2. Search OpenTargets by name + cross-reference match
-          3. Fall back to OLS4/MONDO xref lookup
+          1. Check if ORPHA code is obsolete and redirect to current code
+          2. Fetch disease name from Orphanet API
+          3. Search OpenTargets by name
+          4. Fall back: OLS4/MONDO xref lookup
         Result is cached for 1 year.
         """
+        # Step 1: resolve obsolete ORPHA codes automatically
+        active_id = self._resolve_obsolete_orpha(disease_id)
+        if active_id != disease_id:
+            logger.warning(
+                f"{disease_id} is obsolete — redirecting to {active_id}. "
+                f"Update your input data to use {active_id}."
+            )
+            disease_id = active_id
+
+        # Step 2: fetch name and search OT
         disease_name = self._get_disease_name(disease_id)
         if disease_name:
             result = self._search_ot_by_name(disease_id, disease_name)
             if result:
                 logger.info(
-                    f"Resolved {disease_id} → {result} (via name '{disease_name}')"
+                    f"Resolved {disease_id} -> {result} (via name '{disease_name}')"
                 )
                 return result
 
+        # Step 3: OLS4/MONDO xref fallback
         if disease_id.startswith("ORPHA:"):
             result = self._search_via_mondo(disease_id)
             if result:
-                logger.info(f"Resolved {disease_id} → {result} (via MONDO xref)")
+                logger.info(f"Resolved {disease_id} -> {result} (via MONDO xref)")
                 return result
 
         logger.warning(f"OpenTargets: could not resolve EFO ID for {disease_id}")
         return None
 
+    def _resolve_obsolete_orpha(self, disease_id: str) -> str:
+        """
+        Check if an ORPHA code is obsolete and return the current active code.
+        Uses the Orphanet TargetEntity endpoint which returns the redirect
+        for inactive codes. Returns the original disease_id if active or
+        if the check fails.
+        """
+        if not disease_id.startswith("ORPHA:"):
+            return disease_id
+        orpha_num = disease_id.replace("ORPHA:", "")
+        api_key = os.environ.get("ORPHANET_API_KEY", "project")
+        try:
+            r = requests.get(
+                f"{ORPHANET_API}/orphacode/{orpha_num}/TargetEntity",
+                headers={"accept": "application/json", "apiKey": api_key},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                status = data.get("Status", "")
+                if "Inactive" in status or "Obsolete" in status:
+                    target = data.get("Target ORPHAcode")
+                    if target:
+                        return f"ORPHA:{target}"
+            # 404 means the code is active (no redirect exists)
+        except Exception as e:
+            logger.debug(f"Orphanet TargetEntity check failed for {disease_id}: {e}")
+        return disease_id
+
     def _get_disease_name(self, disease_id: str) -> Optional[str]:
+        """
+        Fix #15: Updated Orphanet API URL and response field.
+        Old: /{orpha_num}/Name/en  →  field "Name"       (404 as of 2026)
+        New: /orphacode/{orpha_num}/Name  →  field "Preferred term"
+        """
         if disease_id.startswith("ORPHA:"):
             orpha_num = disease_id.replace("ORPHA:", "")
             try:
-                r = requests.get(f"{ORPHANET_API}/{orpha_num}/Name/en", timeout=10)
+                api_key = os.environ.get("ORPHANET_API_KEY", "project")
+                r = requests.get(
+                    f"{ORPHANET_API}/orphacode/{orpha_num}/Name",
+                    headers={"accept": "application/json", "apiKey": api_key},
+                    timeout=10,
+                )
                 if r.status_code == 200:
                     data = r.json()
-                    return data.get("Name") or data.get("name")
+                    return (
+                        data.get("Preferred term")
+                        or data.get("Name")
+                        or data.get("name")
+                    )
             except Exception as e:
                 logger.debug(f"Orphanet name lookup failed for {disease_id}: {e}")
         return None
 
     def _search_ot_by_name(self, disease_id: str, disease_name: str) -> Optional[str]:
-        orpha_num = disease_id.replace("ORPHA:", "").replace("OMIM:", "")
-        xref_patterns = [f"Orphanet:{orpha_num}", f"Orphanet_{orpha_num}", orpha_num]
-        try:
-            r = requests.post(
-                GRAPHQL_URL,
-                headers=HEADERS,
-                json={
-                    "query": _DISEASE_NAME_SEARCH_QUERY,
-                    "variables": {"query": disease_name},
-                },
-                timeout=20,
-            )
-            r.raise_for_status()
-            rows = r.json().get("data", {}).get("diseases", {}).get("rows", [])
-            # Priority 1: exact xref match
-            for row in rows:
-                if any(pat in str(x) for x in row.get("dbXRefs", []) for pat in xref_patterns):
-                    return row["id"]
-            # Priority 2: name substring match
-            name_lower = disease_name.lower()
-            for row in rows:
-                if name_lower in row.get("name", "").lower():
-                    return row["id"]
-            # Priority 3: first result
-            if rows:
-                return rows[0]["id"]
-        except Exception as e:
-            logger.debug(f"OT name search failed for '{disease_name}': {e}")
+        """
+        Fix #14: Updated from deprecated diseases(q:) to search(queryString:).
+        Fix #16: When Orphanet name contains '/' (e.g. "Idiopathic/heritable PAH"),
+                 OT search returns empty. Try each part of the slash-split as a
+                 fallback so these names still resolve correctly.
+        """
+        # Build list of query terms to try in order
+        queries = [disease_name]
+        if "/" in disease_name:
+            # Try each part of a slash-separated name
+            for part in disease_name.split("/"):
+                part = part.strip()
+                if len(part) > 10:  # skip very short fragments
+                    queries.append(part)
+            # Also try removing the slash entirely
+            queries.append(disease_name.replace("/", " ").strip())
+
+        for query in queries:
+            try:
+                r = requests.post(
+                    GRAPHQL_URL,
+                    headers=HEADERS,
+                    json={
+                        "query": _DISEASE_NAME_SEARCH_QUERY,
+                        "variables": {"query": query},
+                    },
+                    timeout=20,
+                )
+                r.raise_for_status()
+                hits = r.json().get("data", {}).get("search", {}).get("hits", [])
+                if not hits:
+                    continue
+                name_lower = disease_name.lower()
+                # Priority 1: exact name match
+                for hit in hits:
+                    if name_lower == hit.get("name", "").lower():
+                        return hit["id"]
+                # Priority 2: either name contains the other
+                for hit in hits:
+                    hit_name = hit.get("name", "").lower()
+                    if name_lower in hit_name or hit_name in name_lower:
+                        return hit["id"]
+                # Priority 3: first result (only on last query attempt)
+                if query == queries[-1] and hits:
+                    return hits[0]["id"]
+            except Exception as e:
+                logger.debug(f"OT name search failed for '{query}': {e}")
         return None
 
     def _search_via_mondo(self, disease_id: str) -> Optional[str]:

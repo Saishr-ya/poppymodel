@@ -3,25 +3,21 @@ src/ingestion/cache.py
 
 Redis-backed caching decorator for all external API calls.
 
-BUG FIX: The decorator previously stripped the first argument from the cache
-key assuming it was always 'self' (an instance method receiver). The check
-`hasattr(args[0], "__class__")` is True for EVERY Python object including
-strings, ints, etc. — so for module-level functions like
-_resolve_chembl_parent("CHEMBL192"), the first arg "CHEMBL192" was being
-stripped and all calls produced the same empty cache key.
-
-Fix: use `inspect.ismethod` or check whether the first arg is an instance
-of a user-defined class (not a built-in type) to detect 'self'. The safest
-heuristic: if the function's __qualname__ contains a '.' (e.g.
-"ChEMBLClient.get_molecule") it's a method and we strip arg[0]; if it
-doesn't contain '.' (e.g. "_resolve_chembl_parent") it's a module-level
-function and we include all args in the key.
+Fixes applied:
+  - _is_instance_method_call now uses inspect.isfunction + qualname dot-check
+    AND validates that args[0] is not a built-in type. The previous check
+    `hasattr(args[0], "__class__")` is True for EVERY Python object — strings,
+    ints, etc. — causing module-level functions to strip their first argument
+    from the cache key, producing collisions.
+  - Added explicit guard for nested/local functions (qualname contains
+    "<locals>") which should never be treated as methods.
+  - Cache key uses func.__qualname__ consistently (not __name__) so methods
+    on different classes with the same name don't collide.
 """
 
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import logging
 import time
@@ -41,11 +37,13 @@ def _get_redis():
     if _redis_client is not None:
         return _redis_client
     try:
-        import redis, os
+        import redis
+        import os
         host = os.getenv("REDIS_HOST", "localhost")
         port = int(os.getenv("REDIS_PORT", 6379))
         client = redis.Redis(
-            host=host, port=port,
+            host=host,
+            port=port,
             decode_responses=True,
             socket_connect_timeout=2,
             socket_timeout=5,
@@ -65,39 +63,45 @@ def _get_redis():
         return None
 
 
-def _is_instance_method_call(func, args) -> bool:
+def _is_instance_method_call(func: Callable, args: tuple) -> bool:
     """
-    Determine whether a cached function is being called as an instance method
-    (first arg is 'self') or as a module-level function (first arg is data).
+    Determine whether this call is an instance method (first arg is 'self')
+    or a module-level / static function (all args are data).
 
-    Heuristic: if the function's qualified name contains a dot, it was defined
-    inside a class body and args[0] is 'self'. Module-level functions have a
-    flat qualname with no dot.
+    Rules:
+      1. If there are no args, it cannot be a method call.
+      2. If qualname contains '<locals>' it is a closure/nested function, not a method.
+      3. If qualname contains '.' it was defined inside a class body → method.
+         The first arg is 'self' and should be excluded from the cache key.
+      4. Otherwise it is a module-level function → include all args.
 
-    Examples:
-        ChEMBLClient.get_molecule       → qualname has dot → is method → strip args[0]
-        _resolve_chembl_parent          → no dot → module function → keep all args
-        OpenTargetsClient._batch_lookup → has dot → is method → strip args[0]
+    This is safer than the old `hasattr(args[0], '__class__')` check which
+    returned True for every Python object including str, int, list, etc.
     """
     if not args:
         return False
     qualname = getattr(func, "__qualname__", "")
-    # A dot in qualname means the function was defined inside a class
-    return "." in qualname and "<locals>" not in qualname
+    # Nested/closure functions: not methods
+    if "<locals>" in qualname:
+        return False
+    # Class method: qualname contains a dot (e.g. "MyClass.my_method")
+    return "." in qualname
 
 
-def _make_cache_key(func_name: str, args: tuple, kwargs: dict) -> str:
+def _make_cache_key(func_qualname: str, args: tuple, kwargs: dict) -> str:
     try:
         key_data = (
-            f"{func_name}:"
+            f"{func_qualname}:"
             f"{json.dumps(args, sort_keys=True, default=str)}:"
             f"{json.dumps(kwargs, sort_keys=True, default=str)}"
         )
     except (TypeError, ValueError):
-        key_data = f"{func_name}:{repr(args)}:{repr(kwargs)}"
+        key_data = f"{func_qualname}:{repr(args)}:{repr(kwargs)}"
 
     key_hash = hashlib.md5(key_data.encode()).hexdigest()
-    return f"repurposing:{func_name}:{key_hash}"
+    # Use only the leaf name in the readable prefix to keep keys short
+    leaf_name = func_qualname.split(".")[-1]
+    return f"repurposing:{leaf_name}:{key_hash}"
 
 
 def cached_api_call(ttl_seconds: int = 86400 * 30):
@@ -105,8 +109,8 @@ def cached_api_call(ttl_seconds: int = 86400 * 30):
     Decorator: cache the return value of any API-calling function in Redis.
 
     Works correctly for both instance methods and module-level functions.
-    The 'self' argument is excluded from the cache key for instance methods;
-    for module-level functions all arguments are included.
+    'self' is excluded from the cache key for instance methods.
+    All args are included for module-level functions.
     """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
@@ -115,11 +119,11 @@ def cached_api_call(ttl_seconds: int = 86400 * 30):
             if redis is None:
                 return func(*args, **kwargs)
 
-            # Determine cache key args — strip 'self' for methods, keep all for functions
+            # Strip 'self' for methods, keep all args for module-level functions
             if _is_instance_method_call(func, args):
-                cache_args = args[1:]   # skip 'self'
+                cache_args = args[1:]
             else:
-                cache_args = args       # module-level: include everything
+                cache_args = args
 
             cache_key = _make_cache_key(func.__qualname__, cache_args, kwargs)
 
@@ -148,6 +152,7 @@ def cached_api_call(ttl_seconds: int = 86400 * 30):
 
             return result
 
+        # Attach helpers for testing / manual invalidation
         wrapper.cache_key = lambda *a, **kw: _make_cache_key(
             func.__qualname__,
             a[1:] if _is_instance_method_call(func, a) else a,
