@@ -13,33 +13,71 @@
       "geo_id": "GSE113439",
       "disease_id": "ORPHA:422",
       "disease_name": "Pulmonary arterial hypertension",
-      "case_keywords": ["pah", "pulmonary arterial hypertension", "patient"],
-      "control_keywords": ["control", "healthy", "normal", "donor"],
+      "case_keywords": [
+        "pah",
+        "pulmonary arterial hypertension",
+        "patient"
+      ],
+      "control_keywords": [
+        "control",
+        "healthy",
+        "normal",
+        "donor"
+      ],
       "notes": "Microarray, Affymetrix HG-U133 Plus 2.0"
     },
     {
       "geo_id": "GSE13675",
       "disease_id": "ORPHA:77",
       "disease_name": "Gaucher disease type 1",
-      "case_keywords": ["gaucher", "gd", "type 1"],
-      "control_keywords": ["control", "healthy", "normal"],
+      "case_keywords": [
+        "gaucher",
+        "gd",
+        "type 1"
+      ],
+      "control_keywords": [
+        "control",
+        "healthy",
+        "normal"
+      ],
       "notes": "Microarray"
     },
     {
       "geo_id": "GSE143272",
       "disease_id": "ORPHA:33069",
       "disease_name": "Dravet syndrome",
-      "case_keywords": ["dravet", "scn1a", "patient"],
-      "control_keywords": ["control", "healthy", "normal", "wildtype", "wt"],
+      "case_keywords": [
+        "dravet",
+        "scn1a",
+        "patient"
+      ],
+      "control_keywords": [
+        "control",
+        "healthy",
+        "normal",
+        "wildtype",
+        "wt"
+      ],
       "notes": "Microarray"
     },
     {
       "geo_id": "GSE38680",
       "disease_id": "ORPHA:566",
       "disease_name": "Pompe disease",
-      "case_keywords": ["pompe", "gaa", "glycogen storage"],
-      "control_keywords": ["control", "healthy", "normal"],
+      "case_keywords": [
+        "pompe",
+        "gaa",
+        "glycogen storage"
+      ],
+      "control_keywords": [
+        "control",
+        "healthy",
+        "normal"
+      ],
       "notes": "Microarray"
     }
-  ]
+  ],
+  "_no_microarray_datasets": {
+    " ORPHA:324": "Fabry disease: no human microarray datasets on GEO as of 2026. All available datasets (GSE178947, GSE282204, GSE241251) are RNA-Seq. Transcriptomic layer will return null for this disease. Layer 1A/1B/Literature/Business still score normally."
+  }
 }

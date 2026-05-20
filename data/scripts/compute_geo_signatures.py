@@ -66,13 +66,22 @@ NCBI_EFETCH  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 GEO_QUERY_URL = "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi"
 
 # Common control/case terms for auto-detection
+# Covers clinical samples AND cell/iPSC model terminology
 _CONTROL_TERMS = {
-    "control", "healthy", "normal", "donor", "wildtype", "wt",
-    "unaffected", "non-disease", "ctrl", "hc", "nd",
+    "control", "healthy", "normal", "donor", "unaffected", "non-disease",
+    "ctrl", "hc", "nd",
+    "wildtype", "wild type", "wild-type", "wt", "isogenic",
+    "scramble", "scrambled", "empty vector", "vehicle",
+    "untreated", "mock", "parental",
+    "rescue", "corrected", "restored",
 }
 _CASE_TERMS = {
-    "patient", "disease", "affected", "case", "subject",
-    "diagnosed", "positive", "treated",  # treated is ambiguous but often case
+    "patient", "disease", "affected", "case", "subject", "diagnosed",
+    "knock down", "knockdown", "knockout", "knock out", "kd", "ko",
+    "mutant", "mutation", "deficient", "deficiency",
+    "overexpression", "transfected",
+    "gla", "fabry", "gaucher", "pompe", "dravet", "pah",
+    "lysosomal", "enzyme deficiency",
 }
 
 
@@ -103,8 +112,7 @@ def search_geo_datasets(disease_name: str, max_results: int = 20) -> list[str]:
     Returns list of GEO Series UIDs.
     """
     query = (
-        f'"{disease_name}"[Title/Abstract] '
-        f'AND "expression profiling by array"[DataSet Type] '
+        f'{disease_name}[Title/Abstract] '
         f'AND "Homo sapiens"[Organism]'
     )
     try:
@@ -118,6 +126,7 @@ def search_geo_datasets(disease_name: str, max_results: int = 20) -> list[str]:
                 "usehistory": "n",
             },
             timeout=20,
+            headers={"User-Agent": "PoppyRepurposingEngine/1.0 (research)"},
         )
         r.raise_for_status()
         ids = r.json().get("esearchresult", {}).get("idlist", [])
@@ -132,19 +141,19 @@ def fetch_geo_summaries(uids: list[str]) -> list[dict]:
     """Fetch GEO dataset summaries for a list of UIDs."""
     if not uids:
         return []
+    time.sleep(0.4)  # NCBI rate limit: 3 req/sec without API key
     try:
         r = requests.get(
             NCBI_ESUMMARY,
-            params={
-                "db": "gds",
-                "id": ",".join(uids),
-                "retmode": "json",
-            },
+            params={"db": "gds", "id": ",".join(uids), "retmode": "json"},
             timeout=20,
+            headers={"User-Agent": "PoppyRepurposingEngine/1.0 (research)"},
         )
         r.raise_for_status()
         result = r.json().get("result", {})
-        return [result[uid] for uid in uids if uid in result]
+        summaries = [result[uid] for uid in uids if uid in result and uid != "uids"]
+        logger.info(f"Fetched {len(summaries)} GEO summaries")
+        return summaries
     except Exception as e:
         logger.error(f"NCBI GEO summary fetch failed: {e}")
         return []
@@ -154,15 +163,26 @@ def score_dataset(summary: dict) -> tuple[float, dict]:
     """
     Score a GEO dataset summary for suitability.
     Returns (score, info_dict).
-    Higher = better candidate.
+
+    NCBI esummary (db=gds) field names:
+      accession → GSE ID (e.g. "GSE12345")
+      title     → dataset title
+      n_samples → sample count (int or string)
+      gpl       → platform accession
+      summary   → abstract text
     """
     score = 0.0
+    try:
+        n_samples = int(summary.get("n_samples", 0))
+    except (ValueError, TypeError):
+        n_samples = 0
+
     info = {
-        "geo_id":   summary.get("accession", ""),
-        "title":    summary.get("title", ""),
-        "n_samples": int(summary.get("n_samples", 0)),
-        "platform": summary.get("gpl", ""),
-        "summary":  summary.get("summary", "")[:200],
+        "geo_id":    summary.get("accession", ""),
+        "title":     summary.get("title", ""),
+        "n_samples": n_samples,
+        "platform":  summary.get("gpl", ""),
+        "summary":   summary.get("summary", "")[:200],
     }
 
     n = info["n_samples"]
@@ -191,10 +211,17 @@ def score_dataset(summary: dict) -> tuple[float, dict]:
     return score, info
 
 
-def detect_case_control_keywords(geo_id: str) -> tuple[list[str], list[str]]:
+def detect_case_control_keywords(
+    geo_id: str,
+    auto_confirm: bool = False,
+) -> tuple[list[str], list[str]]:
     """
     Download a GEO series and extract case/control keywords from
     characteristics_ch1 metadata blocks.
+
+    When auto-classify fails, shows the user the unique metadata values
+    and prompts them to pick case/control keywords instead of silently
+    returning empty (which caused every Fabry disease dataset to be skipped).
 
     Returns (case_keywords, control_keywords).
     """
@@ -215,12 +242,10 @@ def detect_case_control_keywords(geo_id: str) -> tuple[list[str], list[str]]:
                 all_values.append(val)
 
     if not all_values:
-        # Fall back to title metadata
         for gsm in gse.gsms.values():
             title = " ".join(gsm.metadata.get("title", [])).lower()
             all_values.append(title)
 
-    # Count value frequencies
     value_counts = Counter(all_values)
     unique_values = [v for v, _ in value_counts.most_common(30)]
 
@@ -233,18 +258,37 @@ def detect_case_control_keywords(geo_id: str) -> tuple[list[str], list[str]]:
         elif val_words & _CASE_TERMS:
             case_kw.append(val)
 
-    # If we couldn't classify anything, return most frequent 2 values as candidates
-    if not case_kw and not control_kw and len(unique_values) >= 2:
-        logger.warning(
-            f"{geo_id}: could not auto-classify sample groups. "
-            f"Top values: {unique_values[:5]}"
-        )
+    # Auto-classify succeeded
+    if case_kw or control_kw:
+        return list(dict.fromkeys(case_kw))[:5], list(dict.fromkeys(control_kw))[:5]
+
+    # Auto-classify failed — show values and prompt user (unless --yes)
+    print(f"\n  Could not auto-classify sample groups for {geo_id}.")
+    print(f"  Unique metadata values found ({len(unique_values)} total):")
+    for i, v in enumerate(unique_values[:15], 1):
+        print(f"    [{i:2d}] {v}  (n={value_counts[v]})")
+
+    if auto_confirm:
+        # In --yes mode, pick the two most frequent values as case/control
+        if len(unique_values) >= 2:
+            print(f"  --yes mode: auto-assigning case={unique_values[0]}, control={unique_values[1]}")
+            return [unique_values[0]], [unique_values[1]]
         return [], []
 
-    # Deduplicate and limit
-    case_kw    = list(dict.fromkeys(case_kw))[:5]
-    control_kw = list(dict.fromkeys(control_kw))[:5]
+    print()
+    case_input = input(
+        "  Enter CASE keyword(s) from the list above (comma-separated, or blank to skip): "
+    ).strip()
+    if not case_input:
+        return [], []
+    ctrl_input = input(
+        "  Enter CONTROL keyword(s) from the list above (comma-separated): "
+    ).strip()
+    if not ctrl_input:
+        return [], []
 
+    case_kw    = [k.strip() for k in case_input.split(",")  if k.strip()]
+    control_kw = [k.strip() for k in ctrl_input.split(",") if k.strip()]
     return case_kw, control_kw
 
 
@@ -300,7 +344,7 @@ def cmd_discover(disease_name: str, disease_id: str, auto_confirm: bool = False)
         geo_id = info["geo_id"]
         print(f"─── {geo_id} ───────────────────────────────────────────")
 
-        case_kw, control_kw = detect_case_control_keywords(geo_id)
+        case_kw, control_kw = detect_case_control_keywords(geo_id, auto_confirm=auto_confirm)
 
         if not case_kw or not control_kw:
             print(f"  ⚠  Could not auto-detect case/control groups for {geo_id}.")
